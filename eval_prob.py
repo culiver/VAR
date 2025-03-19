@@ -19,10 +19,88 @@ from utils.data import build_dataset
 from torch.utils.data import DataLoader
 import tqdm
 import json
+import matplotlib.pyplot as plt
 
 MODEL_DEPTH = 16  # TODO: =====> please specify MODEL_DEPTH <=====
 assert MODEL_DEPTH in {16, 20, 24, 30}
 LOG_DIR = "./output"
+
+
+def create_heatmaps_for_classes(probs: torch.Tensor, patch_nums: list, input_img: torch.Tensor, alpha: float = 0.5):
+    """
+    Given a probability tensor of shape (10, L) (10 classes, L = sum(p^2) patches across 10 layers)
+    and an input image tensor normalized to [-1, 1], create a heatmap overlay for each class.
+    
+    Args:
+        probs (torch.Tensor): Tensor of shape (10, L), where each row corresponds to one class's patch probabilities.
+        patch_nums (list): List of patch counts per side for each layer (length should be 10).
+        input_img (torch.Tensor): Input image tensor of shape (3, 256, 256) normalized to [-1, 1].
+        alpha (float): Blending factor for overlay (0 = only input image, 1 = only heatmap).
+    
+    Returns:
+        List[np.ndarray]: A list of 10 overlaid images (one per class) as NumPy arrays.
+    """
+    patch_nums = patch_nums[:len(patch_nums)//2]
+    num_classes = probs.shape[0]
+    overlaid_images = []
+    combined_heatmap_list = []
+
+    # Compute total number of patches L = sum(p^2)
+    total_patches = sum([p*p for p in patch_nums])
+    
+    # Convert the input image from tensor normalized in [-1,1] to numpy image in [0,255]
+    # Assuming input_img shape is (3, H, W)
+    img_np = input_img.clone().detach().cpu()  # clone to avoid modifying original tensor
+    # Convert from [-1, 1] to [0, 1]
+    img_np = (img_np + 1) / 2  
+    # Convert to numpy and change channel order from (C, H, W) to (H, W, C)
+    if input_img.dim() == 4:
+        input_img = input_img.squeeze(0)
+    img_np = (input_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    
+    for class_idx in range(num_classes):
+        # Get the probability vector for this class (shape: (L,))
+        prob_vector = probs[class_idx]  
+        layer_heatmaps = []
+        start = 0
+        
+        # Process each layer individually.
+        for p in patch_nums:
+            num_patches = p * p  # Number of patches in this layer.
+            # Slice out the probabilities for this layer.
+            layer_probs = prob_vector[start:start + num_patches]
+            start += num_patches
+            
+            # Reshape into a 2D grid (1, 1, p, p) for interpolation.
+            patch_map = layer_probs.view(1, 1, p, p)
+            # Upsample to 256x256 using bilinear interpolation.
+            upsampled = torch.nn.functional.interpolate(patch_map, size=(256, 256), mode='bilinear', align_corners=False)
+            upsampled = upsampled.squeeze()  # Now shape (256,256)
+            layer_heatmaps.append(upsampled * (num_patches / total_patches))
+        
+        # Combine the per-layer heatmaps (here we take the average).
+        combined_heatmap = torch.stack(layer_heatmaps, dim=0).sum(dim=0)
+        combined_heatmap = combined_heatmap.cpu().numpy()
+        combined_heatmap_list.append(combined_heatmap)
+    
+    combined_heatmap_list = np.stack(combined_heatmap_list)
+    for combined_heatmap in combined_heatmap_list:
+        # Normalize the combined heatmap to [0,1]
+        combined_heatmap = combined_heatmap - combined_heatmap_list.min()
+        if combined_heatmap.max() > 0:
+            combined_heatmap = combined_heatmap / (combined_heatmap_list.max() - combined_heatmap_list.min())
+        
+        # Create a colored heatmap using a colormap (e.g., 'jet').
+        cmap = plt.get_cmap('jet')
+        # Get RGB (ignoring alpha), then convert to uint8 scale [0,255]
+        colored_heatmap = (cmap(combined_heatmap)[..., :3] * 255).astype(np.uint8)
+        
+        # Blend the heatmap with the input image.
+        # Here, blending is done via weighted addition.
+        overlay = np.clip(img_np * (1 - alpha) + colored_heatmap * alpha, 0, 255).astype(np.uint8)
+        overlaid_images.append(overlay)
+
+    return overlaid_images
 
 
 def main():
@@ -152,8 +230,9 @@ def main():
             pbar.set_description(f"Acc: {100 * correct / total:.2f}%")
         # sample
         img = img.to(device)
-        remaining_classes = [i for i in range(num_classes)]
+        remaining_classes = [i for i in range(num_classes)][:10]
         likelihood_list = []
+        log_prob_list = []
         json_fname = osp.join(run_folder, f"{idx}.json")
         with torch.inference_mode():
             # with torch.autocast('cuda', enabled=True, dtype=torch.float16, cache_enabled=True):    # using bfloat16 can be faster
@@ -190,13 +269,30 @@ def main():
                 gt_log_probs = log_probs.gather(
                     dim=-1, index=gt_tokens.unsqueeze(-1)
                 ).squeeze(-1)  # (B, L)
+                
+                log_prob_list.append(gt_log_probs)
 
                 # Sum the log probabilities along the sequence to get the overall log likelihood.
                 log_likelihood = gt_log_probs.sum(dim=1)  # (B,)
 
                 likelihood_list.append(log_likelihood)
-        likelihood_list = torch.cat(likelihood_list, dim=0)
+        # log_prob_list = torch.cat(log_prob_list, dim=0).softmax(dim=0)
+        log_prob_list = torch.cat(log_prob_list, dim=0)
+        # print(torch.bincount(torch.argmax(log_prob_list, dim=0)))
+        
+        overlays = create_heatmaps_for_classes(log_prob_list, patch_nums, img, alpha=0.5)
+        # Display the overlaid images for each class.
+        fig, axs = plt.subplots(2, 5, figsize=(15, 6))
+        axs = axs.flatten()
+        for i, overlay in enumerate(overlays):
+            axs[i].imshow(overlay)
+            axs[i].axis('off')
+            axs[i].set_title(f"Class {i}")
+        plt.tight_layout()
+        plt.savefig(osp.join(run_folder, f"{idx}.png"))
+        plt.close()
 
+        likelihood_list = torch.cat(likelihood_list, dim=0)
         pred = torch.argmax(likelihood_list)
         data = {"pred": pred.item(), "label": label.item()}
         with open(json_fname, "w") as f:
