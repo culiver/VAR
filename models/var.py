@@ -233,6 +233,135 @@ class VAR(nn.Module):
                 x_BLC[0, 0, 0] += s
         return x_BLC    # logits BLV, V is vocab_size
     
+    @torch.no_grad()
+    def inpainting(
+        self,
+        image: torch.Tensor,
+        gt_tokens: torch.Tensor,
+        mask: torch.Tensor,
+        label: torch.Optional[Union[int, torch.LongTensor]] = None,
+        g_seed: torch.Optional[int] = None,
+        cfg: float = 1.5,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        more_smooth: bool = False,
+    ) -> torch.Tensor:
+        """
+        Inpaint the masked regions of an image while keeping the unmasked regions intact.
+        
+        :param image: Input image tensor (B, C, H, W).
+        :param mask: Binary mask tensor for latent tokens (B, L) where True indicates a token to keep.
+                     The mask must have the same shape as the latent token sequence obtained from the VAE.
+        :param label: Class condition (an int or tensor of shape (B,)); if None, sampled randomly.
+        :param g_seed: Optional random seed.
+        :param cfg: Classifier-free guidance ratio.
+        :param top_k: Top-k sampling parameter.
+        :param top_p: Top-p (nucleus) sampling parameter.
+        :param more_smooth: If True, apply smoothing via gumbel softmax.
+        :return: Inpainted image tensor (B, 3, H, W) with values in [0, 1].
+        """
+        # Check that the provided mask has the same shape as the latent token sequence.
+        if mask.shape != gt_tokens.shape:
+            raise ValueError("Mask shape must match the latent token shape obtained from vae.img_to_idxBl")
+        
+        # Prepare teacher-forcing input (if needed in other parts; here we only need the tokens).
+        # x_BLCv_wo_first_l = self.quantize.idxBl_to_var_input(gt_idx_list)
+        
+        # Prepare class condition
+        B = image.shape[0]  # Batch size
+        if label is None:
+            # Sample random labels if not provided.
+            label = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True).reshape(B)
+        elif isinstance(label, int):
+            label = torch.full((B,), fill_value=label, device=image.device)
+        label_B = label
+        
+        # Get class embeddings for conditioning. (Also used to construct the start-of-sequence tokens.)
+        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        
+        # Prepare positional embeddings and initial next_token_map as in autoregressive inference.
+        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + \
+                         self.pos_start.expand(2 * B, self.first_l, -1) + \
+                         lvl_pos[:, :self.first_l]
+        
+        cur_L = 0  # Running counter over token positions
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        
+        # Set up RNG for sampling if a seed is provided.
+        if g_seed is None:
+            rng = None
+        else:
+            self.rng.manual_seed(g_seed)
+            rng = self.rng
+        
+        # Enable key-value caching for efficiency.
+        for b in self.blocks: 
+            b.attn.kv_caching(True)
+        
+        # Process each stage (scale) sequentially.
+        for si, pn in enumerate(self.patch_nums):
+            ratio = si / self.num_stages_minus_1  # Scale-dependent ratio
+            cur_L_segment = pn * pn              # Number of tokens in this stage
+            cur_L_end = cur_L + cur_L_segment     # End index for current stage
+            
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            x = next_token_map
+            AdaLNSelfAttn.forward
+            # Forward pass through transformer blocks.
+            for b in self.blocks:
+                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD)
+            
+            # Apply classifier-free guidance.
+            t = cfg * ratio
+            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+            
+            # Sample tokens for the current stage.
+            sampled_tokens = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            
+            # For positions where the mask is True, keep the original latent tokens;
+            # for positions to inpaint (mask False), use the sampled tokens.
+            orig_tokens_segment = gt_tokens[:, cur_L:cur_L_end]
+            mask_segment = mask[:, cur_L:cur_L_end].bool()
+            final_tokens = torch.where(mask_segment, orig_tokens_segment, sampled_tokens)
+            cur_L = cur_L_end  # Move to the next segment
+            
+            # Obtain embedding for the final tokens.
+            if not more_smooth:
+                h_BChw = self.vae_quant_proxy[0].embedding(final_tokens)  # (B, l, Cvae)
+            else:
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                h_BChw = gumbel_softmax_with_rng(
+                    logits_BlV.mul(1 + ratio),
+                    tau=gum_t,
+                    hard=False,
+                    dim=-1,
+                    rng=rng
+                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+            
+            # Reshape to spatial layout.
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                si, len(self.patch_nums), f_hat, h_BChw
+            )
+            
+            # Prepare next_token_map for the next stage if not at the final scale.
+            if si != self.num_stages_minus_1:
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = self.word_embed(next_token_map) + \
+                                 lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+                next_token_map = next_token_map.repeat(2, 1, 1)  # Duplicate for CFG processing
+            
+        
+        # Disable key-value caching.
+        for b in self.blocks: 
+            b.attn.kv_caching(False)
+        
+        # Decode the reconstructed latent representation back to an image.
+        inpainted_img = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+        return inpainted_img
+    
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated
         
