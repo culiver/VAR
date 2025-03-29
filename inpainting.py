@@ -45,18 +45,6 @@ def save_tensor_image(tensor, filename="output_image.png"):
     pil_image.save(filename)
 
 
-def img_idx_to_row_idx(idx_list):
-    patch_nums_array = np.array([1, 2, 3, 4, 5, 6, 8, 10, 13, 16])
-    patch_cumsums = np.cumsum(patch_nums_array**2)
-    result_list = []
-    for (lidx, hidx, widx) in idx_list:
-        assert lidx > 0
-        patch_num = patch_nums_array[lidx]
-        idx = patch_cumsums[lidx-1] + hidx * patch_num + widx
-        result_list.append(idx)
-    return result_list
-
-
 def generate_inpainting_mask(patch_nums, target_layer, patch_coord_list):
     """
     Generate a binary mask for latent tokens across scales, allowing for multiple patch coordinates.
@@ -220,12 +208,17 @@ def main():
     )
     parser.add_argument("--partial", type=int, default=200)
     parser.add_argument("--batch_size", "-b", type=int, default=1)
+    parser.add_argument("--depth", type=int, default=16)
     args = parser.parse_args()
+    MODEL_DEPTH = args.depth
 
     args.extra = "inpainting"
 
     name = f"var"
     extra = args.extra if args.extra is not None else ""
+
+    if args.depth != 16:
+        name += f"_d{args.depth}"
 
     run_folder = (
         osp.join(LOG_DIR, args.dataset, name)
@@ -342,13 +335,16 @@ def main():
                 # Convert the image to its latent representation (list of token indices)
                 gt_tokens = torch.cat(gt_idx_list, dim=1)
 
-                # Suppose we want to mask a patch at the sixth layer (index 5)
-                # For example, choose the patch at row 2, column 3 in the 6x6 grid.
-                target_layer = 7
-                patch_coord_list = [(4, 4), (4, 5), (4, 6), (4, 7), (5, 4), (5, 5), (5, 6), (5, 7), (6, 4), (6, 5), (6, 6), (6, 7), (7, 4), (7, 5), (7, 6), (7, 7)]
+                # # Suppose we want to mask a patch at the sixth layer (index 5)
+                # # For example, choose the patch at row 2, column 3 in the 6x6 grid.
+                # target_layer = 7
+                # patch_coord_list = [(4, 4), (4, 5), (4, 6), (4, 7), (5, 4), (5, 5), (5, 6), (5, 7), (6, 4), (6, 5), (6, 6), (6, 7), (7, 4), (7, 5), (7, 6), (7, 7)]
                 
-                # Generate the inpainting mask.
-                mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list).to(device).unsqueeze(0)
+                # # Generate the inpainting mask.
+                # mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list).to(device).unsqueeze(0)
+
+                mask = torch.ones_like(gt_tokens).to(device)
+                mask[:, -525:] = 0
 
                 # Run inpainting.
                 inpainted_output = var.inpainting(img, gt_tokens, mask, cfg=cfg, top_k=900, top_p=0.95, label=class_labels[0], g_seed=seed)

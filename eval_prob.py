@@ -21,6 +21,8 @@ import tqdm
 import json
 import matplotlib.pyplot as plt
 
+from utils_clf import generate_inpainting_mask
+
 MODEL_DEPTH = 16  # TODO: =====> please specify MODEL_DEPTH <=====
 assert MODEL_DEPTH in {16, 20, 24, 30}
 LOG_DIR = "./output"
@@ -133,11 +135,16 @@ def main():
         "--extra", type=str, default=None, help="to add to the dataset name"
     )
     parser.add_argument("--partial", type=int, default=200)
+    parser.add_argument("--depth", type=int, default=16)
     parser.add_argument("--batch_size", "-b", type=int, default=1)
+    parser.add_argument("--plot", action='store_true')
     args = parser.parse_args()
+    MODEL_DEPTH = args.depth
 
     name = f"var"
     extra = args.extra if args.extra is not None else ""
+    if args.depth != 16:
+        name += f"_d{args.depth}"
 
     run_folder = (
         osp.join(LOG_DIR, args.dataset, name)
@@ -165,7 +172,7 @@ def main():
 
     # download checkpoint
     hf_home = "https://huggingface.co/FoundationVision/var/resolve/main"
-    vae_ckpt, var_ckpt = "vae_ch160v4096z32.pth", f"var_d{MODEL_DEPTH}.pth"
+    vae_ckpt, var_ckpt = "vae_ch160v4096z32.pth", f"var_d{args.depth}.pth"
     if not osp.exists(vae_ckpt):
         os.system(f"wget {hf_home}/{vae_ckpt}")
     if not osp.exists(var_ckpt):
@@ -276,21 +283,26 @@ def main():
                 log_likelihood = gt_log_probs.sum(dim=1)  # (B,)
 
                 likelihood_list.append(log_likelihood)
-        # log_prob_list = torch.cat(log_prob_list, dim=0).softmax(dim=0)
-        log_prob_list = torch.cat(log_prob_list, dim=0)
-        # print(torch.bincount(torch.argmax(log_prob_list, dim=0)))
-        
-        overlays = create_heatmaps_for_classes(log_prob_list, patch_nums, img, alpha=0.5)
-        # Display the overlaid images for each class.
-        fig, axs = plt.subplots(2, 5, figsize=(15, 6))
-        axs = axs.flatten()
-        for i, overlay in enumerate(overlays):
-            axs[i].imshow(overlay)
-            axs[i].axis('off')
-            axs[i].set_title(f"Class {i}")
-        plt.tight_layout()
-        plt.savefig(osp.join(run_folder, f"{idx}.png"))
-        plt.close()
+
+        if args.plot:
+            log_prob_list = torch.cat(log_prob_list, dim=0)
+            overlays = create_heatmaps_for_classes(log_prob_list, patch_nums, img, alpha=0.5)
+            # Display the overlaid images for each class.
+            fig, axs = plt.subplots(2, 5, figsize=(15, 6))
+            axs = axs.flatten()
+            for i, overlay in enumerate(overlays):
+                axs[i].imshow(overlay)
+                axs[i].axis('off')
+                axs[i].set_title(f"Class {i}")
+            plt.tight_layout()
+            plt.savefig(osp.join(run_folder, f"{idx}.png"))
+            plt.close()
+
+        target_layer = 7
+        patch_coord_list = [(4, 4), (4, 5), (4, 6), (4, 7), (5, 4), (5, 5), (5, 6), (5, 7), (6, 4), (6, 5), (6, 6), (6, 7), (7, 4), (7, 5), (7, 6), (7, 7)]
+        # Generate the inpainting mask.
+        mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list, reverse=True).to(device).unsqueeze(0)
+        likelihood_list = [log_prob[mask].sum().unsqueeze(0) for log_prob in log_prob_list]
 
         likelihood_list = torch.cat(likelihood_list, dim=0)
         pred = torch.argmax(likelihood_list)
