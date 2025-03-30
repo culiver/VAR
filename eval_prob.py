@@ -22,6 +22,7 @@ import json
 import matplotlib.pyplot as plt
 
 from utils_clf import generate_inpainting_mask
+import torch.nn.functional as F
 
 MODEL_DEPTH = 16  # TODO: =====> please specify MODEL_DEPTH <=====
 assert MODEL_DEPTH in {16, 20, 24, 30}
@@ -136,8 +137,11 @@ def main():
     )
     parser.add_argument("--partial", type=int, default=200)
     parser.add_argument("--depth", type=int, default=16)
+    parser.add_argument("--cfg", type=float, default=4)
+    parser.add_argument("--Clayer", type=int, default=None)
     parser.add_argument("--batch_size", "-b", type=int, default=1)
     parser.add_argument("--plot", action='store_true')
+    parser.add_argument("--mode", type=str, default="bayesian")
     args = parser.parse_args()
     MODEL_DEPTH = args.depth
 
@@ -145,6 +149,11 @@ def main():
     extra = args.extra if args.extra is not None else ""
     if args.depth != 16:
         name += f"_d{args.depth}"
+    if args.mode != "bayesian":
+        name += f"_mode[{args.mode}]"
+    if args.Clayer:
+        name += f"_Clayer[{args.Clayer}]"
+    name += f"_cfg[{args.cfg}]"
 
     run_folder = (
         osp.join(LOG_DIR, args.dataset, name)
@@ -180,6 +189,8 @@ def main():
 
     # build vae, var
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    patch_nums_square_cumsum = np.cumsum(np.array(patch_nums)**2)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if "vae" not in globals() or "var" not in globals():
         vae, var = build_vae_var(
@@ -204,13 +215,18 @@ def main():
         p.requires_grad_(False)
     print(f"prepare finished.")
 
+    if args.mode == "gen":
+        dino_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14")
+        dino_model = dino_model.to(device)
+
+
     ############################# 2. Sample with classifier-free guidance
 
     # set args
     seed = 0  # @param {type:"number"}
     torch.manual_seed(seed)
     num_sampling_steps = 250  # @param {type:"slider", min:0, max:1000, step:1}
-    cfg = 4  # @param {type:"slider", min:1, max:10, step:0.1}
+    # cfg = 4  # @param {type:"slider", min:1, max:10, step:0.1}
     # class_labels = (980, 980, 437, 437, 22, 22, 562, 562)  #@param {type:"raw"}
     more_smooth = False  # True for more smooth output
 
@@ -237,10 +253,25 @@ def main():
             pbar.set_description(f"Acc: {100 * correct / total:.2f}%")
         # sample
         img = img.to(device)
+        if args.mode == "gen":
+            new_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).to(img.device)
+            new_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).to(img.device)
+            old_mean = 0.5
+            old_std  = 0.5
+            img_input = img * (old_std / new_std) + ((old_mean - new_mean) / new_std)
+            img_input = F.interpolate(img_input, size=(224, 224), mode='bicubic')
         remaining_classes = [i for i in range(num_classes)][:10]
         likelihood_list = []
         log_prob_list = []
         json_fname = osp.join(run_folder, f"{idx}.json")
+        if os.path.exists(json_fname):
+            # print("Skipping", i)
+            with open(json_fname, "r") as f:
+                # Reading from json file
+                data = json.load(f)
+            correct += int(data["pred"] == data["label"])
+            total += 1
+            continue
         with torch.inference_mode():
             # with torch.autocast('cuda', enabled=True, dtype=torch.float16, cache_enabled=True):    # using bfloat16 can be faster
             while len(remaining_classes) > 0:
@@ -257,32 +288,71 @@ def main():
                 gt_idx_list = vae.img_to_idxBl(img)  # List of tensors for each stage
                 # Convert the image to its latent representation (list of token indices)
                 gt_tokens = torch.cat(gt_idx_list, dim=1)
+                if args.mode == "bayesian":
+                    # Prepare the teacher forcing input (excluding the first tokens)
+                    # Here, we assume the same function is used as during training.
+                    x_BLCv_wo_first_l = vae.quantize.idxBl_to_var_input(gt_idx_list)
 
-                # Prepare the teacher forcing input (excluding the first tokens)
-                # Here, we assume the same function is used as during training.
-                x_BLCv_wo_first_l = vae.quantize.idxBl_to_var_input(gt_idx_list)
+                    # Pass through the forward method to get logits for each token position.
+                    # The forward method uses teacher forcing, meaning it conditions on the ground truth tokens.
+                    logits = var.forward(
+                        label_B, x_BLCv_wo_first_l
+                    )  # (B, L, V) where V is vocab_size
 
-                # Pass through the forward method to get logits for each token position.
-                # The forward method uses teacher forcing, meaning it conditions on the ground truth tokens.
-                logits = var.forward(
-                    label_B, x_BLCv_wo_first_l
-                )  # (B, L, V) where V is vocab_size
+                    # Compute log probabilities over the vocabulary.
+                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
 
-                # Compute log probabilities over the vocabulary.
-                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
+                    # Gather the log probabilities corresponding to the ground truth tokens.
+                    # gt_tokens has shape (B, L), so we unsqueeze to (B, L, 1) for gathering.
+                    gt_log_probs = log_probs.gather(
+                        dim=-1, index=gt_tokens.unsqueeze(-1)
+                    ).squeeze(-1)  # (B, L)
+                    
+                    log_prob_list.append(gt_log_probs)
 
-                # Gather the log probabilities corresponding to the ground truth tokens.
-                # gt_tokens has shape (B, L), so we unsqueeze to (B, L, 1) for gathering.
-                gt_log_probs = log_probs.gather(
-                    dim=-1, index=gt_tokens.unsqueeze(-1)
-                ).squeeze(-1)  # (B, L)
-                
-                log_prob_list.append(gt_log_probs)
+                    if args.Clayer:
+                        mask = torch.zeros_like(gt_tokens).to(device)
+                        mask[:, patch_nums_square_cumsum[args.Clayer]:] = 1
+                        mask = mask.bool()
+                        log_likelihood = gt_log_probs[mask].sum().unsqueeze(0)
+                    else:
+                        # Sum the log probabilities along the sequence to get the overall log likelihood.
+                        log_likelihood = gt_log_probs.sum(dim=1)  # (B,)
 
-                # Sum the log probabilities along the sequence to get the overall log likelihood.
-                log_likelihood = gt_log_probs.sum(dim=1)  # (B,)
+                    likelihood_list.append(log_likelihood)
+                elif args.mode == "gen":
+                    # Create a mask where a specific region is set to 0.
+                    # Here we assume that the last 525 tokens (for example) should be inpainted.
+                    # Adjust the mask as needed.
+                    mask = torch.ones_like(gt_tokens).to(device)
+                    if args.Clayer:
+                        mask[:, patch_nums_square_cumsum[args.Clayer]:] = 0
 
-                likelihood_list.append(log_likelihood)
+                    # Run inpainting. The inpainting function is expected to take the original image,
+                    # the latent tokens (gt_tokens), the mask, and other parameters.
+                    inpainted_output = var.inpainting(
+                        img, gt_tokens, mask,
+                        cfg=args.cfg, top_k=1, top_p=0,
+                        label=class_labels[0], g_seed=seed
+                    )
+
+                    inpainted_img = inpainted_output * (old_std / new_std) + ((old_mean - new_mean) / new_std)
+                    inpainted_img = F.interpolate(inpainted_img, size=(224, 224), mode='bicubic')
+
+                    # Extract features from the original image.
+                    feat_input = dino_model(img_input)[0]
+
+                    # Extract features from the inpainted image.
+                    feat_inpaint = dino_model(inpainted_img)[0]
+
+                    # Compute the L1 distance between the features.
+                    l1_distance = torch.abs(feat_input - feat_inpaint).mean().unsqueeze(0)
+
+                    # Convert the distance to likelihood: lower L1 distance implies higher likelihood.
+                    # Here we use the negative L1 distance as the likelihood score.
+                    likelihood = -l1_distance
+
+                    likelihood_list.append(likelihood)
 
         if args.plot:
             log_prob_list = torch.cat(log_prob_list, dim=0)
@@ -297,12 +367,6 @@ def main():
             plt.tight_layout()
             plt.savefig(osp.join(run_folder, f"{idx}.png"))
             plt.close()
-
-        target_layer = 7
-        patch_coord_list = [(4, 4), (4, 5), (4, 6), (4, 7), (5, 4), (5, 5), (5, 6), (5, 7), (6, 4), (6, 5), (6, 6), (6, 7), (7, 4), (7, 5), (7, 6), (7, 7)]
-        # Generate the inpainting mask.
-        mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list, reverse=True).to(device).unsqueeze(0)
-        likelihood_list = [log_prob[mask].sum().unsqueeze(0) for log_prob in log_prob_list]
 
         likelihood_list = torch.cat(likelihood_list, dim=0)
         pred = torch.argmax(likelihood_list)

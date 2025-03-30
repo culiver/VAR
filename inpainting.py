@@ -344,10 +344,11 @@ def main():
                 # mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list).to(device).unsqueeze(0)
 
                 mask = torch.ones_like(gt_tokens).to(device)
-                mask[:, -525:] = 0
+                # mask[:, -525:] = 0
+                mask[:, -425:] = 0
 
                 # Run inpainting.
-                inpainted_output = var.inpainting(img, gt_tokens, mask, cfg=cfg, top_k=900, top_p=0.95, label=class_labels[0], g_seed=seed)
+                inpainted_output = var.inpainting(img, gt_tokens, mask, cfg=cfg, top_k=1, top_p=0, label=class_labels[0], g_seed=seed)
                 # inpainted_output = var.autoregressive_infer_cfg(B=1, label_B=class_labels[0], cfg=cfg, top_k=900, top_p=0.95, g_seed=seed, more_smooth=more_smooth)
 
                 # Convert the output tensor to a PIL image and save.
