@@ -236,7 +236,6 @@ class VAR(nn.Module):
     @torch.no_grad()
     def inpainting(
         self,
-        image: torch.Tensor,
         gt_tokens: torch.Tensor,
         mask: torch.Tensor,
         label: torch.Optional[Union[int, torch.LongTensor]] = None,
@@ -249,7 +248,6 @@ class VAR(nn.Module):
         """
         Inpaint the masked regions of an image while keeping the unmasked regions intact.
         
-        :param image: Input image tensor (B, C, H, W).
         :param mask: Binary mask tensor for latent tokens (B, L) where True indicates a token to keep.
                      The mask must have the same shape as the latent token sequence obtained from the VAE.
         :param label: Class condition (an int or tensor of shape (B,)); if None, sampled randomly.
@@ -268,12 +266,12 @@ class VAR(nn.Module):
         # x_BLCv_wo_first_l = self.quantize.idxBl_to_var_input(gt_idx_list)
         
         # Prepare class condition
-        B = image.shape[0]  # Batch size
+        B = gt_tokens.shape[0]  # Batch size
         if label is None:
             # Sample random labels if not provided.
             label = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True).reshape(B)
         elif isinstance(label, int):
-            label = torch.full((B,), fill_value=label, device=image.device)
+            label = torch.full((B,), fill_value=label, device=gt_tokens.device)
         label_B = label
         
         # Get class embeddings for conditioning. (Also used to construct the start-of-sequence tokens.)
@@ -304,27 +302,30 @@ class VAR(nn.Module):
             ratio = si / self.num_stages_minus_1  # Scale-dependent ratio
             cur_L_segment = pn * pn              # Number of tokens in this stage
             cur_L_end = cur_L + cur_L_segment     # End index for current stage
-            
+
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
             AdaLNSelfAttn.forward
             # Forward pass through transformer blocks.
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD)
-            
-            # Apply classifier-free guidance.
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            
-            # Sample tokens for the current stage.
-            sampled_tokens = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            
-            # For positions where the mask is True, keep the original latent tokens;
-            # for positions to inpaint (mask False), use the sampled tokens.
-            orig_tokens_segment = gt_tokens[:, cur_L:cur_L_end]
-            mask_segment = mask[:, cur_L:cur_L_end].bool()
-            final_tokens = torch.where(mask_segment, orig_tokens_segment, sampled_tokens)
+            if torch.all(mask[:, cur_L:cur_L_end].bool()):
+                final_tokens = gt_tokens[:, cur_L:cur_L_end]
+            else:
+                logits_BlV = self.get_logits(x, cond_BD)
+                
+                # Apply classifier-free guidance.
+                t = cfg * ratio
+                logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+                
+                # Sample tokens for the current stage.
+                sampled_tokens = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+                
+                # For positions where the mask is True, keep the original latent tokens;
+                # for positions to inpaint (mask False), use the sampled tokens.
+                orig_tokens_segment = gt_tokens[:, cur_L:cur_L_end]
+                mask_segment = mask[:, cur_L:cur_L_end].bool()
+                final_tokens = torch.where(mask_segment, orig_tokens_segment, sampled_tokens)
             cur_L = cur_L_end  # Move to the next segment
             
             # Obtain embedding for the final tokens.

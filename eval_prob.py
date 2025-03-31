@@ -23,10 +23,71 @@ import matplotlib.pyplot as plt
 
 from utils_clf import generate_inpainting_mask
 import torch.nn.functional as F
+import torchvision.models as models
+import torch.nn as nn
+import clip
 
 MODEL_DEPTH = 16  # TODO: =====> please specify MODEL_DEPTH <=====
 assert MODEL_DEPTH in {16, 20, 24, 30}
 LOG_DIR = "./output"
+
+
+def smooth_log_probs_by_k(log_probs, k):
+    """
+    Smooth the probability distribution in groups of k tokens.
+    
+    Args:
+        log_probs (torch.Tensor): Log probabilities of shape (B, L, V) where V is vocab size.
+        k (int): Group size for smoothing. k=1 returns original distribution; k=V yields uniform.
+    
+    Returns:
+        torch.Tensor: New log probabilities smoothed by grouping k tokens together.
+    """
+    B, L, V = log_probs.shape
+    # Convert to probabilities.
+    probs = torch.exp(log_probs)
+    # Sort probabilities in descending order along the vocab dimension.
+    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+    
+    # Determine number of complete groups and remainder.
+    num_complete_groups = V // k
+    remainder = V % k
+    
+    # If there is a remainder, pad sorted_probs so that the last group has k elements.
+    if remainder > 0:
+        pad_size = k - remainder
+        padding = torch.zeros(B, L, pad_size, device=log_probs.device, dtype=sorted_probs.dtype)
+        sorted_probs_padded = torch.cat([sorted_probs, padding], dim=-1)
+        # Create a mask for valid entries (ones for real tokens, zeros for padded).
+        mask = torch.ones(B, L, V, device=log_probs.device, dtype=sorted_probs.dtype)
+        pad_mask = torch.zeros(B, L, pad_size, device=log_probs.device, dtype=sorted_probs.dtype)
+        mask = torch.cat([mask, pad_mask], dim=-1)
+        
+        # Reshape into groups of size k.
+        groups = sorted_probs_padded.view(B, L, -1, k)  # shape (B, L, num_groups, k)
+        mask_groups = mask.view(B, L, -1, k)
+        # Compute group means using only valid tokens.
+        group_sum = (groups * mask_groups).sum(dim=-1)
+        group_count = mask_groups.sum(dim=-1)
+        group_mean = group_sum / group_count
+        # Expand group mean back to group shape.
+        expanded_group_mean = group_mean.unsqueeze(-1).expand_as(groups)
+        # Flatten back to original (padded) shape.
+        new_sorted_probs = expanded_group_mean.reshape(B, L, -1)[:, :, :V]  # remove extra padding
+    else:
+        # If V is divisible by k, simply reshape and average.
+        groups = sorted_probs.view(B, L, -1, k)  # shape (B, L, num_groups, k)
+        group_mean = groups.mean(dim=-1)  # shape (B, L, num_groups)
+        expanded_group_mean = group_mean.unsqueeze(-1).expand_as(groups)
+        new_sorted_probs = expanded_group_mean.reshape(B, L, V)
+    
+    # Unsort: create a new tensor of the same shape and scatter the smoothed values back.
+    new_probs = torch.empty_like(new_sorted_probs)
+    new_probs.scatter_(dim=-1, index=sorted_idx, src=new_sorted_probs)
+    
+    # Convert back to log probabilities.
+    new_log_probs = torch.log(new_probs + 1e-10)  # epsilon for numerical stability
+    return new_log_probs
 
 
 def create_heatmaps_for_classes(probs: torch.Tensor, patch_nums: list, input_img: torch.Tensor, alpha: float = 0.5):
@@ -142,6 +203,7 @@ def main():
     parser.add_argument("--batch_size", "-b", type=int, default=1)
     parser.add_argument("--plot", action='store_true')
     parser.add_argument("--mode", type=str, default="bayesian")
+    parser.add_argument("--feat", type=str, default="dinov2")
     args = parser.parse_args()
     MODEL_DEPTH = args.depth
 
@@ -151,6 +213,8 @@ def main():
         name += f"_d{args.depth}"
     if args.mode != "bayesian":
         name += f"_mode[{args.mode}]"
+    if args.feat != "dinov2":
+        name += f"_feat[{args.feat}]"
     if args.Clayer:
         name += f"_Clayer[{args.Clayer}]"
     name += f"_cfg[{args.cfg}]"
@@ -216,8 +280,28 @@ def main():
     print(f"prepare finished.")
 
     if args.mode == "gen":
-        dino_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14")
-        dino_model = dino_model.to(device)
+        old_mean = 0.5
+        old_std  = 0.5
+        if args.feat == "resnet50":
+            new_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).to(device)
+            new_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).to(device)
+            # Load pretrained ResNet50 and remove the final classification layer.
+            resnet = models.resnet50(pretrained=True)
+            # Remove the last fully-connected layer; use adaptive pooling output as features.
+            feature_extractor = nn.Sequential(*list(resnet.children())[:-1])
+            feature_extractor.eval()  # Set to eval mode
+            feature_extractor.to(device)
+        elif args.feat == "clip":
+            new_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, -1, 1, 1).to(device)
+            new_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, -1, 1, 1).to(device)
+            clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
+            clip_model.eval()
+            feature_extractor = clip_model.encode_image
+        else:
+            new_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).to(device)
+            new_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).to(device)
+            feature_extractor = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14")
+            feature_extractor.to(device)
 
 
     ############################# 2. Sample with classifier-free guidance
@@ -252,12 +336,8 @@ def main():
         if total > 0:
             pbar.set_description(f"Acc: {100 * correct / total:.2f}%")
         # sample
-        img = img.to(device)
+        img = img.to(device)            
         if args.mode == "gen":
-            new_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).to(img.device)
-            new_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).to(img.device)
-            old_mean = 0.5
-            old_std  = 0.5
             img_input = img * (old_std / new_std) + ((old_mean - new_mean) / new_std)
             img_input = F.interpolate(img_input, size=(224, 224), mode='bicubic')
         remaining_classes = [i for i in range(num_classes)][:10]
@@ -331,28 +411,83 @@ def main():
                     # Run inpainting. The inpainting function is expected to take the original image,
                     # the latent tokens (gt_tokens), the mask, and other parameters.
                     inpainted_output = var.inpainting(
-                        img, gt_tokens, mask,
+                        gt_tokens.repeat(args.batch_size, 1), mask.repeat(args.batch_size, 1),
                         cfg=args.cfg, top_k=1, top_p=0,
-                        label=class_labels[0], g_seed=seed
+                        label=label_B, g_seed=seed
                     )
 
-                    inpainted_img = inpainted_output * (old_std / new_std) + ((old_mean - new_mean) / new_std)
-                    inpainted_img = F.interpolate(inpainted_img, size=(224, 224), mode='bicubic')
+                    if args.feat == "vae_fhat":
+                        # --- VAE fhat feature ---
+                        fhat_input = vae.img_to_fhat(img)[-1]
+                        fhat_inpaint = vae.img_to_fhat(inpainted_output)[-1]
 
-                    # Extract features from the original image.
-                    feat_input = dino_model(img_input)[0]
+                        feat_input = fhat_input.view(1, -1)
+                        feat_inpaint = fhat_inpaint.view(args.batch_size, -1)
 
-                    # Extract features from the inpainted image.
-                    feat_inpaint = dino_model(inpainted_img)[0]
+                    elif args.feat == "vae_post":
+                        # --- VAE post_quant feature ---
+                        fhat_input = vae.img_to_post(img)
+                        fhat_inpaint = vae.img_to_post(inpainted_output)
+
+                        feat_input = fhat_input.view(1, -1)
+                        feat_inpaint = fhat_inpaint.view(args.batch_size, -1)
+                    else:
+                        inpainted_img = inpainted_output * (old_std / new_std) + ((old_mean - new_mean) / new_std)
+                        inpainted_img = F.interpolate(inpainted_img, size=(224, 224), mode='bicubic')
+
+                        # Extract features from the original image.
+                        feat_input = feature_extractor(img_input)
+                        feat_input = feat_input.view(1, -1)
+
+                        # Extract features from the inpainted image.
+                        feat_inpaint = feature_extractor(inpainted_img)
+                        feat_inpaint = feat_inpaint.view(args.batch_size, -1)
 
                     # Compute the L1 distance between the features.
-                    l1_distance = torch.abs(feat_input - feat_inpaint).mean().unsqueeze(0)
+                    l1_distance = torch.abs(feat_input - feat_inpaint).mean(dim=-1)
 
                     # Convert the distance to likelihood: lower L1 distance implies higher likelihood.
                     # Here we use the negative L1 distance as the likelihood score.
                     likelihood = -l1_distance
 
                     likelihood_list.append(likelihood)
+
+                elif args.mode == "smooth_bayesian":
+                    # Prepare the teacher forcing input (excluding the first tokens)
+                    # Here, we assume the same function is used as during training.
+                    x_BLCv_wo_first_l = vae.quantize.idxBl_to_var_input(gt_idx_list)
+
+                    # Pass through the forward method to get logits for each token position.
+                    # The forward method uses teacher forcing, meaning it conditions on the ground truth tokens.
+                    logits = var.forward(
+                        label_B, x_BLCv_wo_first_l
+                    )  # (B, L, V) where V is vocab_size
+
+                    # Compute log probabilities over the vocabulary.
+                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
+
+                    # Smooth the distribution by grouping every k tokens.
+                    k = 50  # For example, change k to adjust the smoothing
+                    log_probs = smooth_log_probs_by_k(log_probs, k)
+
+                    # Gather the log probabilities corresponding to the ground truth tokens.
+                    # gt_tokens has shape (B, L), so we unsqueeze to (B, L, 1) for gathering.
+                    gt_log_probs = log_probs.gather(
+                        dim=-1, index=gt_tokens.unsqueeze(-1)
+                    ).squeeze(-1)  # (B, L)
+                    
+                    log_prob_list.append(gt_log_probs)
+
+                    if args.Clayer:
+                        mask = torch.zeros_like(gt_tokens).to(device)
+                        mask[:, patch_nums_square_cumsum[args.Clayer]:] = 1
+                        mask = mask.bool()
+                        log_likelihood = gt_log_probs[mask].sum().unsqueeze(0)
+                    else:
+                        # Sum the log probabilities along the sequence to get the overall log likelihood.
+                        log_likelihood = gt_log_probs.sum(dim=1)  # (B,)
+
+                    likelihood_list.append(log_likelihood)
 
         if args.plot:
             log_prob_list = torch.cat(log_prob_list, dim=0)

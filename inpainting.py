@@ -254,6 +254,7 @@ def main():
 
     # build vae, var
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    patch_nums_square_cumsum = np.cumsum(np.array(patch_nums)**2)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if "vae" not in globals() or "var" not in globals():
         vae, var = build_vae_var(
@@ -344,11 +345,10 @@ def main():
                 # mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list).to(device).unsqueeze(0)
 
                 mask = torch.ones_like(gt_tokens).to(device)
-                # mask[:, -525:] = 0
-                mask[:, -425:] = 0
+                mask[:, patch_nums_square_cumsum[6]:] = 0
 
                 # Run inpainting.
-                inpainted_output = var.inpainting(img, gt_tokens, mask, cfg=cfg, top_k=1, top_p=0, label=class_labels[0], g_seed=seed)
+                inpainted_output = var.inpainting(gt_tokens, mask, cfg=cfg, top_k=1, top_p=0, label=class_labels[0], g_seed=seed)
                 # inpainted_output = var.autoregressive_infer_cfg(B=1, label_B=class_labels[0], cfg=cfg, top_k=900, top_p=0.95, g_seed=seed, more_smooth=more_smooth)
 
                 # Convert the output tensor to a PIL image and save.
