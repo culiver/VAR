@@ -363,6 +363,162 @@ class VAR(nn.Module):
         inpainted_img = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
         return inpainted_img
     
+    @torch.no_grad()
+    def smooth_sampling(
+        self,
+        gt_tokens: torch.Tensor,
+        n: int,
+        label: Optional[Union[int, torch.LongTensor]] = None,
+        g_seed: Optional[int] = None,
+        cfg: float = 1.5,
+        more_smooth: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Smooth sampling using a neighbor-based approach without a mask.
+        
+        For each position in the latent token sequence, the function restricts the candidate tokens
+        to the top-n nearest neighbors of the corresponding ground truth token (as measured by L2 distance
+        over the quantized embeddings) and selects the candidate with the highest log likelihood.
+        
+        The candidate set is gradually widened across stages. For each stage with ratio = si/(num_stages_minus_1),
+        the candidate set size is computed as:
+        
+            candidate_count = 1 + int((n - 1) * ratio)
+        
+        This means that early stages only search among the single most similar token, and by the final stage
+        the full candidate set of size n is considered.
+        
+        :param gt_tokens: Ground-truth latent token indices (B, L).
+        :param n: The maximum number of nearest neighbors (in embedding space) to consider at the final stage.
+        :param label: Class condition (an int or tensor of shape (B,)); if None, sampled randomly.
+        :param g_seed: Optional random seed.
+        :param cfg: Classifier-free guidance ratio.
+        :param more_smooth: If True, apply smoothing via Gumbel softmax (not used in neighbor sampling).
+        :return: A tuple (sampled_img, sum_log_likelihood) where sampled_img is the reconstructed image 
+                tensor (B, 3, H, W) and sum_log_likelihood is a scalar tensor representing the accumulated log likelihood.
+        """
+        B = gt_tokens.shape[0]  # Batch size
+
+        # Prepare class condition.
+        if label is None:
+            label = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True).reshape(B)
+        elif isinstance(label, int):
+            label = torch.full((B,), fill_value=label, device=gt_tokens.device)
+        label_B = label
+        
+        # Get class embeddings for conditioning.
+        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        
+        # Prepare positional embeddings and initial next_token_map as in autoregressive inference.
+        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + \
+                        self.pos_start.expand(2 * B, self.first_l, -1) + \
+                        lvl_pos[:, :self.first_l]
+        
+        cur_L = 0  # Running counter over token positions
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        
+        # Set up RNG for sampling if a seed is provided.
+        if g_seed is None:
+            rng = None
+        else:
+            self.rng.manual_seed(g_seed)
+            rng = self.rng
+        
+        # Enable key-value caching for efficiency.
+        for b in self.blocks: 
+            b.attn.kv_caching(True)
+        
+        # Precompute the neighbor lookup table based on L2 distance.
+        emb_weight = self.vae_proxy[0].quantize.embedding.weight  # (V, D)
+        dists = torch.cdist(emb_weight, emb_weight, p=2)  # (V, V)
+        neighbors = torch.argsort(dists, dim=1)  # (V, V) - tokens sorted by increasing distance.
+        top_n_neighbors = neighbors[:, :n]  # (V, n)
+        
+        # Initialize a tensor to accumulate the sum of log likelihoods.
+        sum_log_likelihood = 0.0
+
+        # Process each stage (scale) sequentially.
+        for si, pn in enumerate(self.patch_nums):
+            ratio = si / self.num_stages_minus_1  # Scale-dependent ratio in [0, 1]
+            # Gradually increase the candidate set size from 1 to n.
+            candidate_count = 1 + int((n - 1) * ratio)
+            
+            cur_L_segment = pn * pn              # Number of tokens in this stage
+            cur_L_end = cur_L + cur_L_segment     # End index for current stage
+
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            x = next_token_map
+            # Forward pass through transformer blocks.
+            for b in self.blocks:
+                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            
+            # Obtain logits for the current stage.
+            logits_BlV = self.get_logits(x, cond_BD)
+            # Apply classifier-free guidance.
+            t = cfg * ratio
+            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+            # Compute log probabilities.
+            log_probs = torch.log_softmax(logits_BlV, dim=-1)  # (B, cur_L_segment, vocab)
+            
+            # Get ground truth tokens for this segment.
+            gt_segment = gt_tokens[:, cur_L:cur_L_end]  # (B, cur_L_segment)
+            
+            # For each token, restrict candidates to the gradually increasing neighbor set.
+            # First, select the top-n neighbors of the ground-truth tokens, then narrow the candidate set.
+            candidate_neighbors_full = top_n_neighbors[gt_segment]  # (B, cur_L_segment, n)
+            candidate_neighbors = candidate_neighbors_full[:, :, :candidate_count]  # (B, cur_L_segment, candidate_count)
+            
+            # Gather the log probabilities for these candidate neighbors.
+            candidate_log_probs = torch.gather(log_probs, dim=-1, index=candidate_neighbors)
+            # Select the candidate with the highest log probability.
+            max_vals, max_idx = candidate_log_probs.max(dim=-1)  # Both are (B, cur_L_segment)
+            # Obtain the sampled tokens.
+            sampled_tokens = torch.gather(candidate_neighbors, dim=-1, index=max_idx.unsqueeze(-1)).squeeze(-1)
+            
+            # For each token position, the final token is the sampled token.
+            final_tokens_segment = sampled_tokens
+            cur_L = cur_L_end  # Move to the next segment
+            
+            # Accumulate the log likelihood.
+            sum_log_likelihood = sum_log_likelihood + final_tokens_segment.new_tensor(max_vals).sum()
+            
+            # Obtain latent embeddings for the final tokens.
+            if not more_smooth:
+                h_BChw = self.vae_quant_proxy[0].embedding(final_tokens_segment)  # (B, cur_L_segment, Cvae)
+            else:
+                # If additional smoothing is desired, apply Gumbel softmax.
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                h_BChw = gumbel_softmax_with_rng(
+                    logits_BlV.mul(1 + ratio),
+                    tau=gum_t,
+                    hard=False,
+                    dim=-1,
+                    rng=rng
+                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+            
+            # Reshape to spatial layout.
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                si, len(self.patch_nums), f_hat, h_BChw
+            )
+            
+            # Prepare next_token_map for the next stage if not at the final scale.
+            if si != self.num_stages_minus_1:
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = self.word_embed(next_token_map) + \
+                                lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+                next_token_map = next_token_map.repeat(2, 1, 1)  # Duplicate for CFG processing
+                
+        # Disable key-value caching.
+        for b in self.blocks: 
+            b.attn.kv_caching(False)
+        
+        # Decode the reconstructed latent representation back to an image.
+        sampled_img = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+        
+        return sampled_img, sum_log_likelihood
+
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated
         
