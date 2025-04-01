@@ -373,7 +373,7 @@ class VAR(nn.Module):
         cfg: float = 1.5,
         more_smooth: bool = False,
         neighbor_threshold: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Smooth sampling using a neighbor-based approach without a mask.
         
@@ -393,15 +393,19 @@ class VAR(nn.Module):
         the full candidate set of size n is considered.
         
         2. Threshold mode (if neighbor_threshold is not None):
-        For each stage, an effective threshold is computed for each token based on the nearest candidate's
-        distance. Specifically, let d_min be the distance of the nearest neighbor for a given token.
-        Then the effective threshold is computed as:
+        A constant effective threshold is used. Only candidates whose L2 distance is below 
         
-            effective_threshold = d_min + (neighbor_threshold - d_min) * ratio
+            effective_threshold = neighbor_threshold
         
-        This ensures that at stage 0 the effective threshold is d_min (so at least one candidate qualifies),
-        and at stage 1 the effective threshold is the assigned neighbor_threshold.
-        Only candidates whose L2 distance is below the effective threshold are considered.
+        are considered.
+        
+        In addition to accumulating the standard log likelihood (from the model logits), this function
+        also computes a distance-based log likelihood. This is computed as:
+        
+            log_softmax(-dists, dim=-1)
+        
+        where dists are the L2 distances from the ground-truth token to all candidate tokens (from the top-n candidates).
+        The log probability of the selected candidate (from the full candidate set) is then accumulated.
         
         :param gt_tokens: Ground-truth latent token indices (B, L).
         :param n: The maximum number of nearest neighbors (in embedding space) to consider at the final stage.
@@ -410,9 +414,10 @@ class VAR(nn.Module):
         :param cfg: Classifier-free guidance ratio.
         :param more_smooth: If True, apply smoothing via Gumbel softmax (not used in neighbor sampling).
         :param neighbor_threshold: If provided (a float), use threshold mode; only candidates with L2 distance 
-                                below effective_threshold are considered.
-        :return: A tuple (sampled_img, sum_log_likelihood) where sampled_img is the reconstructed image 
-                tensor (B, 3, H, W) and sum_log_likelihood is a scalar tensor representing the accumulated log likelihood.
+                                below neighbor_threshold are considered.
+        :return: A tuple (sampled_img, sum_log_likelihood, sum_distance_log_likelihood) where sampled_img is 
+                the reconstructed image tensor (B, 3, H, W), sum_log_likelihood is the accumulated log likelihood 
+                from the logits, and sum_distance_log_likelihood is the accumulated log likelihood based on the distances.
         """
         B = gt_tokens.shape[0]  # Batch size
 
@@ -456,8 +461,9 @@ class VAR(nn.Module):
         neighbors = torch.argsort(dists, dim=1)  # (V, V) - tokens sorted by increasing distance.
         top_n_neighbors = neighbors[:, :n]  # (V, n)
         
-        # Initialize a tensor to accumulate the sum of log likelihoods.
+        # Initialize tensors to accumulate log likelihoods.
         sum_log_likelihood = 0.0
+        sum_distance_log_likelihood = 0.0
 
         # Process each stage (scale) sequentially.
         for si, pn in enumerate(self.patch_nums):
@@ -477,7 +483,7 @@ class VAR(nn.Module):
             # Apply classifier-free guidance.
             t = cfg * ratio
             logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            # Compute log probabilities.
+            # Compute log probabilities from logits.
             log_probs = torch.log_softmax(logits_BlV, dim=-1)  # (B, cur_L_segment, vocab)
             
             # Get ground truth tokens for this segment.
@@ -485,6 +491,9 @@ class VAR(nn.Module):
             
             # Retrieve the top-n nearest neighbors for each ground-truth token.
             candidate_neighbors_full = top_n_neighbors[gt_segment]  # (B, cur_L_segment, n)
+            # For distance-based log likelihood, gather all candidate distances.
+            all_candidate_dists = torch.gather(dists[gt_segment], dim=-1, index=candidate_neighbors_full)
+            distance_log_probs = torch.log_softmax(-all_candidate_dists, dim=-1)
             
             if neighbor_threshold is None:
                 # Candidate-count mode: gradually increase candidate set size.
@@ -492,24 +501,23 @@ class VAR(nn.Module):
                 candidate_neighbors = candidate_neighbors_full[:, :, :candidate_count]  # (B, cur_L_segment, candidate_count)
                 candidate_log_probs = torch.gather(log_probs, dim=-1, index=candidate_neighbors)
             else:
-                # Threshold mode: use all top-n candidates, but only consider those with distance below an effective threshold.
-                # Get candidate distances from the precomputed dists matrix.
+                # Threshold mode: constant effective threshold equal to neighbor_threshold.
                 candidate_dists = torch.gather(
                     dists[gt_segment], dim=-1, index=candidate_neighbors_full
                 )  # (B, cur_L_segment, n)
                 # For each token, compute the minimum candidate distance.
                 d_min = candidate_dists[:, :, :1]  # (B, cur_L_segment, 1)
                 # Compute effective threshold per token that scales from d_min at ratio 0 to neighbor_threshold at ratio 1.
+                assert torch.all(neighbor_threshold - d_min) >= 0
                 effective_threshold = d_min + (neighbor_threshold - d_min) * ratio
                 # Build mask: valid candidates are those with distance below effective_threshold.
                 candidate_mask = candidate_dists <= effective_threshold
                 candidate_log_probs = torch.gather(log_probs, dim=-1, index=candidate_neighbors_full)
-                # Mask out candidates that do not satisfy the threshold.
                 candidate_log_probs = candidate_log_probs.masked_fill(~candidate_mask, float("-inf"))
             
             # Select the candidate with the highest log probability.
             max_vals, max_idx = candidate_log_probs.max(dim=-1)  # (B, cur_L_segment)
-            # In threshold mode, if all candidates are masked out (all -inf), fallback to the first candidate.
+            # In threshold mode, if all candidates are masked out (all -inf), fallback to candidate 0.
             fallback_mask = (max_vals == float("-inf"))
             if fallback_mask.any():
                 fallback_vals = torch.gather(
@@ -521,11 +529,15 @@ class VAR(nn.Module):
             # Obtain the sampled tokens.
             sampled_tokens = torch.gather(candidate_neighbors_full, dim=-1, index=max_idx.unsqueeze(-1)).squeeze(-1)
             
+            # Accumulate the distance-based log likelihood.
+            selected_distance_log_probs = torch.gather(distance_log_probs, dim=-1, index=max_idx.unsqueeze(-1)).squeeze(-1)
+            sum_distance_log_likelihood = sum_distance_log_likelihood + selected_distance_log_probs.sum()
+            
+            # Accumulate the log likelihood from logits.
+            sum_log_likelihood = sum_log_likelihood + sampled_tokens.new_tensor(max_vals).sum()
+            
             # Move to the next segment.
             cur_L = cur_L_end  
-            
-            # Accumulate the log likelihood.
-            sum_log_likelihood = sum_log_likelihood + sampled_tokens.new_tensor(max_vals).sum()
             
             # Obtain latent embeddings for the sampled tokens.
             if not more_smooth:
@@ -552,7 +564,7 @@ class VAR(nn.Module):
                 next_token_map = self.word_embed(next_token_map) + \
                                 lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
                 next_token_map = next_token_map.repeat(2, 1, 1)  # Duplicate for CFG processing
-                
+                    
         # Disable key-value caching.
         for b in self.blocks: 
             b.attn.kv_caching(False)
@@ -560,7 +572,7 @@ class VAR(nn.Module):
         # Decode the reconstructed latent representation back to an image.
         sampled_img = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
         
-        return sampled_img, sum_log_likelihood
+        return sampled_img, sum_log_likelihood, sum_distance_log_likelihood
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated

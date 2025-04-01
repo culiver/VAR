@@ -1,5 +1,17 @@
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode smooth_bayesian
+# CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian
+
+# for threshold in $(seq 0.7 0.1 1.6); do
+#     CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold $threshold
+# done
+
+for threshold in $(seq 0.2 0.05 0.7); do
+    CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold $threshold
+done
+
+
+# CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold 1.0
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 24 --partial 500
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 30 --partial 500
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode gen
@@ -42,7 +54,7 @@
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode gen --Clayer 4 --cfg 3 --feat clip
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode gen --Clayer 4 --cfg 3 --feat vae_fhat
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode gen --Clayer 5 --cfg 3 --feat vae_fhat
-CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode gen --Clayer 6 --cfg 3 --feat vae_fhat
+# CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode gen --Clayer 6 --cfg 3 --feat vae_fhat
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode gen --Clayer 4 --cfg 3 --feat vae_post
 
 

@@ -209,6 +209,8 @@ def main():
     parser.add_argument("--partial", type=int, default=200)
     parser.add_argument("--batch_size", "-b", type=int, default=1)
     parser.add_argument("--depth", type=int, default=16)
+    parser.add_argument("--cfg", type=float, default=4)
+    parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
     MODEL_DEPTH = args.depth
 
@@ -219,6 +221,8 @@ def main():
 
     if args.depth != 16:
         name += f"_d{args.depth}"
+    name += f"_cfg[{args.cfg}]"
+    name += f"_threshold[{args.threshold}]"
 
     run_folder = (
         osp.join(LOG_DIR, args.dataset, name)
@@ -345,7 +349,7 @@ def main():
                 # mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list).to(device).unsqueeze(0)
 
                 # Run inpainting.
-                smoothed_output, log_likelihood = var.smooth_sampling(gt_tokens, n=4096, cfg=cfg, label=class_labels[0], g_seed=seed, neighbor_threshold=1.0)
+                smoothed_output, log_likelihood, dist_log_likelihood = var.smooth_sampling(gt_tokens, n=4096, cfg=args.cfg, label=class_labels[0], g_seed=seed, neighbor_threshold=args.threshold)
                 
                 # mask = torch.zeros_like(gt_tokens).to(device)
                 # mask[:, patch_nums_square_cumsum[6]:] = 0
@@ -361,7 +365,8 @@ def main():
                 output_pil = PImage.fromarray(smoothed_img_np)
                 output_pil.save(os.path.join(run_folder, f"{idx}_smoothed_{class_labels[0]}.png"))
                 
-                print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'. {log_likelihood}")
+                print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'. {log_likelihood}, {dist_log_likelihood}, {log_likelihood+dist_log_likelihood}")
+                # print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'. {log_likelihood}")
                 # print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'.")
         if idx >= 10:
             break

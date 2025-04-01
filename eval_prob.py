@@ -204,6 +204,7 @@ def main():
     parser.add_argument("--plot", action='store_true')
     parser.add_argument("--mode", type=str, default="bayesian")
     parser.add_argument("--feat", type=str, default="dinov2")
+    parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
     MODEL_DEPTH = args.depth
 
@@ -218,6 +219,9 @@ def main():
     if args.Clayer:
         name += f"_Clayer[{args.Clayer}]"
     name += f"_cfg[{args.cfg}]"
+    if args.mode == "neighbor_bayesian":
+        name += f"_threshold[{args.threshold}]"
+
 
     run_folder = (
         osp.join(LOG_DIR, args.dataset, name)
@@ -490,41 +494,8 @@ def main():
                     likelihood_list.append(log_likelihood)
 
                 elif args.mode == "neighbor_bayesian":
-                    # Prepare the teacher forcing input (excluding the first tokens)
-                    # Here, we assume the same function is used as during training.
-                    x_BLCv_wo_first_l = vae.quantize.idxBl_to_var_input(gt_idx_list)
-
-                    # Pass through the forward method to get logits for each token position.
-                    # The forward method uses teacher forcing, meaning it conditions on the ground truth tokens.
-                    logits = var.forward(
-                        label_B, x_BLCv_wo_first_l
-                    )  # (B, L, V) where V is vocab_size
-
-                    # Compute log probabilities over the vocabulary.
-                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
-
-                    # Smooth the distribution by grouping every k tokens.
-                    k = 50  # For example, change k to adjust the smoothing
-                    log_probs = smooth_log_probs_by_k(log_probs, k)
-
-                    # Gather the log probabilities corresponding to the ground truth tokens.
-                    # gt_tokens has shape (B, L), so we unsqueeze to (B, L, 1) for gathering.
-                    gt_log_probs = log_probs.gather(
-                        dim=-1, index=gt_tokens.unsqueeze(-1)
-                    ).squeeze(-1)  # (B, L)
-                    
-                    log_prob_list.append(gt_log_probs)
-
-                    if args.Clayer:
-                        mask = torch.zeros_like(gt_tokens).to(device)
-                        mask[:, patch_nums_square_cumsum[args.Clayer]:] = 1
-                        mask = mask.bool()
-                        log_likelihood = gt_log_probs[mask].sum().unsqueeze(0)
-                    else:
-                        # Sum the log probabilities along the sequence to get the overall log likelihood.
-                        log_likelihood = gt_log_probs.sum(dim=1)  # (B,)
-
-                    likelihood_list.append(log_likelihood)
+                    smoothed_output, log_likelihood, _ = var.smooth_sampling(gt_tokens, n=4096, cfg=args.cfg, label=class_labels[0], g_seed=seed, neighbor_threshold=args.threshold)
+                    likelihood_list.append(log_likelihood.unsqueeze(0))
 
         if args.plot:
             log_prob_list = torch.cat(log_prob_list, dim=0)
