@@ -372,6 +372,7 @@ class VAR(nn.Module):
         g_seed: Optional[int] = None,
         cfg: float = 1.5,
         more_smooth: bool = False,
+        neighbor_threshold: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Smooth sampling using a neighbor-based approach without a mask.
@@ -380,13 +381,27 @@ class VAR(nn.Module):
         to the top-n nearest neighbors of the corresponding ground truth token (as measured by L2 distance
         over the quantized embeddings) and selects the candidate with the highest log likelihood.
         
-        The candidate set is gradually widened across stages. For each stage with ratio = si/(num_stages_minus_1),
-        the candidate set size is computed as:
+        The candidate set can be determined in one of two ways:
+        
+        1. Candidate-count mode (if neighbor_threshold is None):
+        The candidate set size is gradually increased across stages. For each stage with 
+        ratio = si/(num_stages_minus_1), the candidate set size is computed as:
         
             candidate_count = 1 + int((n - 1) * ratio)
         
         This means that early stages only search among the single most similar token, and by the final stage
         the full candidate set of size n is considered.
+        
+        2. Threshold mode (if neighbor_threshold is not None):
+        For each stage, an effective threshold is computed for each token based on the nearest candidate's
+        distance. Specifically, let d_min be the distance of the nearest neighbor for a given token.
+        Then the effective threshold is computed as:
+        
+            effective_threshold = d_min + (neighbor_threshold - d_min) * ratio
+        
+        This ensures that at stage 0 the effective threshold is d_min (so at least one candidate qualifies),
+        and at stage 1 the effective threshold is the assigned neighbor_threshold.
+        Only candidates whose L2 distance is below the effective threshold are considered.
         
         :param gt_tokens: Ground-truth latent token indices (B, L).
         :param n: The maximum number of nearest neighbors (in embedding space) to consider at the final stage.
@@ -394,6 +409,8 @@ class VAR(nn.Module):
         :param g_seed: Optional random seed.
         :param cfg: Classifier-free guidance ratio.
         :param more_smooth: If True, apply smoothing via Gumbel softmax (not used in neighbor sampling).
+        :param neighbor_threshold: If provided (a float), use threshold mode; only candidates with L2 distance 
+                                below effective_threshold are considered.
         :return: A tuple (sampled_img, sum_log_likelihood) where sampled_img is the reconstructed image 
                 tensor (B, 3, H, W) and sum_log_likelihood is a scalar tensor representing the accumulated log likelihood.
         """
@@ -407,13 +424,17 @@ class VAR(nn.Module):
         label_B = label
         
         # Get class embeddings for conditioning.
-        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        sos = cond_BD = self.class_emb(
+            torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0)
+        )
         
         # Prepare positional embeddings and initial next_token_map as in autoregressive inference.
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + \
-                        self.pos_start.expand(2 * B, self.first_l, -1) + \
-                        lvl_pos[:, :self.first_l]
+        next_token_map = (
+            sos.unsqueeze(1).expand(2 * B, self.first_l, -1) +
+            self.pos_start.expand(2 * B, self.first_l, -1) +
+            lvl_pos[:, :self.first_l]
+        )
         
         cur_L = 0  # Running counter over token positions
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
@@ -441,8 +462,6 @@ class VAR(nn.Module):
         # Process each stage (scale) sequentially.
         for si, pn in enumerate(self.patch_nums):
             ratio = si / self.num_stages_minus_1  # Scale-dependent ratio in [0, 1]
-            # Gradually increase the candidate set size from 1 to n.
-            candidate_count = 1 + int((n - 1) * ratio)
             
             cur_L_segment = pn * pn              # Number of tokens in this stage
             cur_L_end = cur_L + cur_L_segment     # End index for current stage
@@ -464,30 +483,54 @@ class VAR(nn.Module):
             # Get ground truth tokens for this segment.
             gt_segment = gt_tokens[:, cur_L:cur_L_end]  # (B, cur_L_segment)
             
-            # For each token, restrict candidates to the gradually increasing neighbor set.
-            # First, select the top-n neighbors of the ground-truth tokens, then narrow the candidate set.
+            # Retrieve the top-n nearest neighbors for each ground-truth token.
             candidate_neighbors_full = top_n_neighbors[gt_segment]  # (B, cur_L_segment, n)
-            candidate_neighbors = candidate_neighbors_full[:, :, :candidate_count]  # (B, cur_L_segment, candidate_count)
             
-            # Gather the log probabilities for these candidate neighbors.
-            candidate_log_probs = torch.gather(log_probs, dim=-1, index=candidate_neighbors)
+            if neighbor_threshold is None:
+                # Candidate-count mode: gradually increase candidate set size.
+                candidate_count = 1 + int((n - 1) * ratio)
+                candidate_neighbors = candidate_neighbors_full[:, :, :candidate_count]  # (B, cur_L_segment, candidate_count)
+                candidate_log_probs = torch.gather(log_probs, dim=-1, index=candidate_neighbors)
+            else:
+                # Threshold mode: use all top-n candidates, but only consider those with distance below an effective threshold.
+                # Get candidate distances from the precomputed dists matrix.
+                candidate_dists = torch.gather(
+                    dists[gt_segment], dim=-1, index=candidate_neighbors_full
+                )  # (B, cur_L_segment, n)
+                # For each token, compute the minimum candidate distance.
+                d_min = candidate_dists[:, :, :1]  # (B, cur_L_segment, 1)
+                # Compute effective threshold per token that scales from d_min at ratio 0 to neighbor_threshold at ratio 1.
+                effective_threshold = d_min + (neighbor_threshold - d_min) * ratio
+                # Build mask: valid candidates are those with distance below effective_threshold.
+                candidate_mask = candidate_dists <= effective_threshold
+                candidate_log_probs = torch.gather(log_probs, dim=-1, index=candidate_neighbors_full)
+                # Mask out candidates that do not satisfy the threshold.
+                candidate_log_probs = candidate_log_probs.masked_fill(~candidate_mask, float("-inf"))
+            
             # Select the candidate with the highest log probability.
-            max_vals, max_idx = candidate_log_probs.max(dim=-1)  # Both are (B, cur_L_segment)
-            # Obtain the sampled tokens.
-            sampled_tokens = torch.gather(candidate_neighbors, dim=-1, index=max_idx.unsqueeze(-1)).squeeze(-1)
+            max_vals, max_idx = candidate_log_probs.max(dim=-1)  # (B, cur_L_segment)
+            # In threshold mode, if all candidates are masked out (all -inf), fallback to the first candidate.
+            fallback_mask = (max_vals == float("-inf"))
+            if fallback_mask.any():
+                fallback_vals = torch.gather(
+                    candidate_log_probs, dim=-1, index=torch.zeros_like(max_idx).unsqueeze(-1)
+                ).squeeze(-1)
+                max_vals = torch.where(fallback_mask, fallback_vals, max_vals)
+                max_idx = torch.where(fallback_mask, torch.zeros_like(max_idx), max_idx)
             
-            # For each token position, the final token is the sampled token.
-            final_tokens_segment = sampled_tokens
-            cur_L = cur_L_end  # Move to the next segment
+            # Obtain the sampled tokens.
+            sampled_tokens = torch.gather(candidate_neighbors_full, dim=-1, index=max_idx.unsqueeze(-1)).squeeze(-1)
+            
+            # Move to the next segment.
+            cur_L = cur_L_end  
             
             # Accumulate the log likelihood.
-            sum_log_likelihood = sum_log_likelihood + final_tokens_segment.new_tensor(max_vals).sum()
+            sum_log_likelihood = sum_log_likelihood + sampled_tokens.new_tensor(max_vals).sum()
             
-            # Obtain latent embeddings for the final tokens.
+            # Obtain latent embeddings for the sampled tokens.
             if not more_smooth:
-                h_BChw = self.vae_quant_proxy[0].embedding(final_tokens_segment)  # (B, cur_L_segment, Cvae)
+                h_BChw = self.vae_quant_proxy[0].embedding(sampled_tokens)  # (B, cur_L_segment, Cvae)
             else:
-                # If additional smoothing is desired, apply Gumbel softmax.
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
                 h_BChw = gumbel_softmax_with_rng(
                     logits_BlV.mul(1 + ratio),

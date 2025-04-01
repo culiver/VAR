@@ -1,1 +1,1 @@
-python smoothing.py --cfg 0
+python smoothing.py

@@ -345,7 +345,7 @@ def main():
                 # mask = generate_inpainting_mask(patch_nums, target_layer, patch_coord_list).to(device).unsqueeze(0)
 
                 # Run inpainting.
-                smoothed_output, log_likelihood = var.smooth_sampling(gt_tokens, n=8, cfg=cfg, label=class_labels[0], g_seed=seed)
+                smoothed_output, log_likelihood = var.smooth_sampling(gt_tokens, n=4096, cfg=cfg, label=class_labels[0], g_seed=seed, neighbor_threshold=1.0)
                 
                 # mask = torch.zeros_like(gt_tokens).to(device)
                 # mask[:, patch_nums_square_cumsum[6]:] = 0
@@ -361,8 +361,8 @@ def main():
                 output_pil = PImage.fromarray(smoothed_img_np)
                 output_pil.save(os.path.join(run_folder, f"{idx}_smoothed_{class_labels[0]}.png"))
                 
-                # print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'. {log_likelihood}")
-                print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'.")
+                print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'. {log_likelihood}")
+                # print(f"Smoothing complete. The image has been saved as 'smoothed_demo.png'.")
         if idx >= 10:
             break
 
