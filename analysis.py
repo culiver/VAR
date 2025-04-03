@@ -123,6 +123,12 @@ def main():
     os.makedirs(run_folder, exist_ok=True)
     print(f"Run folder: {run_folder}")
 
+    layerwise_folder = osp.join(LOG_DIR, args.dataset, name, "layerwise") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, name + f"_{extra}", "layer_analysis")
+    os.makedirs(layerwise_folder, exist_ok=True)
+
+    layer_acc_folder = osp.join(LOG_DIR, args.dataset, name, "layer_acc") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, name + f"_{extra}", "layer_acc_analysis")
+    os.makedirs(layer_acc_folder, exist_ok=True)
+
     # Build dataset
     num_classes, dataset_train, dataset_val = build_dataset(args.data_path, final_reso=256, hflip=False)
     ld_val = DataLoader(dataset_val, num_workers=0, pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
@@ -191,6 +197,18 @@ def main():
     correct_d30 = 0
     total_d16 = 0
     total_d30 = 0
+    
+    # Track accuracies for each scale
+    scale_correct_d16 = {i: 0 for i in range(len(patch_nums))}
+    scale_total_d16 = {i: 0 for i in range(len(patch_nums))}
+    scale_correct_d30 = {i: 0 for i in range(len(patch_nums))}
+    scale_total_d30 = {i: 0 for i in range(len(patch_nums))}
+    
+    # Track accuracies for accumulated likelihoods
+    acc_correct_d16 = {k: 0 for k in range(len(patch_nums))}  # k from 0 to 9
+    acc_total_d16 = {k: 0 for k in range(len(patch_nums))}
+    acc_correct_d30 = {k: 0 for k in range(len(patch_nums))}
+    acc_total_d30 = {k: 0 for k in range(len(patch_nums))}
 
     # Dictionaries to store probabilities across all samples per class.
     overall_class_probs_d16 = {cls: [] for cls in [i for i in range(num_classes)][:10] + [1000]}
@@ -210,6 +228,15 @@ def main():
         # For per-sample plotting if needed.
         prob_list_d16 = []
         prob_list_d30 = []
+        
+        # Store log likelihoods for each scale
+        scale_log_likelihoods_d16 = {i: [] for i in range(len(patch_nums))}
+        scale_log_likelihoods_d30 = {i: [] for i in range(len(patch_nums))}
+        
+        # Store accumulated log likelihoods
+        acc_log_likelihoods_d16 = {k: [] for k in range(len(patch_nums))}  # k from 0 to 9
+        acc_log_likelihoods_d30 = {k: [] for k in range(len(patch_nums))}
+        
         json_fname = osp.join(run_folder, f"{idx}.json")
         with torch.inference_mode():
             while len(remaining_classes) > 0:
@@ -243,24 +270,106 @@ def main():
                     overall_class_probs_d16[cls].append(gt_probs_d16[i].detach().cpu())
                     overall_class_probs_d30[cls].append(gt_probs_d30[i].detach().cpu())
 
-                if args.Clayer:
-                    mask = torch.zeros_like(gt_tokens).to(device)
-                    mask[:, patch_nums_square_cumsum[args.Clayer]:] = 1
-                    mask = mask.bool()
-                    log_likelihood_d16 = log_probs_d16.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)[mask].sum().unsqueeze(0)
-                    log_likelihood_d30 = log_probs_d30.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)[mask].sum().unsqueeze(0)
-                else:
-                    log_likelihood_d16 = log_probs_d16.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
-                    log_likelihood_d30 = log_probs_d30.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
+                # Calculate log likelihood for each scale
+                gt_log_probs_d16 = log_probs_d16.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L)
+                gt_log_probs_d30 = log_probs_d30.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L)
+                
+                start_idx = 0
+                for scale_idx, num_patches in enumerate(patch_nums):
+                    num_patches_square = num_patches * num_patches
+                    end_idx = start_idx + num_patches_square
+                    
+                    # Sum over patches in this scale
+                    scale_log_likelihood_d16 = gt_log_probs_d16[:, start_idx:end_idx].sum(dim=-1)
+                    scale_log_likelihood_d30 = gt_log_probs_d30[:, start_idx:end_idx].sum(dim=-1)
+                    
+                    scale_log_likelihoods_d16[scale_idx].append(scale_log_likelihood_d16)
+                    scale_log_likelihoods_d30[scale_idx].append(scale_log_likelihood_d30)
+                    
+                    acc_scale_log_likelihood_d16 = gt_log_probs_d16[:, :end_idx].sum(dim=-1)
+                    acc_scale_log_likelihood_d30 = gt_log_probs_d30[:, :end_idx].sum(dim=-1)
+
+                    # Calculate accumulated likelihoods up to this scale
+                    acc_log_likelihoods_d16[scale_idx].append(acc_scale_log_likelihood_d16)
+                    acc_log_likelihoods_d30[scale_idx].append(acc_scale_log_likelihood_d30)
+                    
+                    start_idx = end_idx
+                
+                # Calculate overall log likelihood
+                log_likelihood_d16 = gt_log_probs_d16.sum(dim=-1)
+                log_likelihood_d30 = gt_log_probs_d30.sum(dim=-1)
                 log_likelihood_list_d16.append(log_likelihood_d16)
                 log_likelihood_list_d30.append(log_likelihood_d30)
         
+        # Concatenate all log likelihoods
         log_likelihood_list_d16 = torch.cat(log_likelihood_list_d16, dim=0)
         log_likelihood_list_d30 = torch.cat(log_likelihood_list_d30, dim=0)
+        
+        # Calculate predictions for each scale
+        for scale_idx in range(len(patch_nums)):
+            scale_log_likelihoods_d16[scale_idx] = torch.cat(scale_log_likelihoods_d16[scale_idx], dim=0)
+            scale_log_likelihoods_d30[scale_idx] = torch.cat(scale_log_likelihoods_d30[scale_idx], dim=0)
+            
+            pred_d16_scale = torch.argmax(scale_log_likelihoods_d16[scale_idx][:-1])
+            pred_d30_scale = torch.argmax(scale_log_likelihoods_d30[scale_idx][:-1])
+            
+            # Update accuracies for this scale
+            if pred_d16_scale.item() == label.item():
+                scale_correct_d16[scale_idx] += 1
+            scale_total_d16[scale_idx] += 1
+            if pred_d30_scale.item() == label.item():
+                scale_correct_d30[scale_idx] += 1
+            scale_total_d30[scale_idx] += 1
+            
+            # Save scale-specific results
+            scale_json_fname = osp.join(layerwise_folder, f"{idx}_{scale_idx}-layer.json")
+            scale_data = {
+                "pred_d16": pred_d16_scale.item(),
+                "pred_d30": pred_d30_scale.item(),
+                "label": label.item(),
+                "target_log_likelihood_d16": scale_log_likelihoods_d16[scale_idx][label.item()].item(),
+                "target_log_likelihood_d30": scale_log_likelihoods_d30[scale_idx][label.item()].item(),
+                "log_likelihood_d16": scale_log_likelihoods_d16[scale_idx].detach().cpu().tolist(),
+                "log_likelihood_d30": scale_log_likelihoods_d30[scale_idx].detach().cpu().tolist(),
+            }
+            with open(scale_json_fname, "w") as f:
+                json.dump(scale_data, f, indent=4)
+        
+        # Calculate predictions for accumulated likelihoods
+        for k in range(len(patch_nums)):
+            acc_log_likelihoods_d16[k] = torch.cat(acc_log_likelihoods_d16[k], dim=0)
+            acc_log_likelihoods_d30[k] = torch.cat(acc_log_likelihoods_d30[k], dim=0)
+            
+            pred_d16_acc = torch.argmax(acc_log_likelihoods_d16[k][:-1])
+            pred_d30_acc = torch.argmax(acc_log_likelihoods_d30[k][:-1])
+            
+            # Update accuracies for accumulated likelihoods
+            if pred_d16_acc.item() == label.item():
+                acc_correct_d16[k] += 1
+            acc_total_d16[k] += 1
+            if pred_d30_acc.item() == label.item():
+                acc_correct_d30[k] += 1
+            acc_total_d30[k] += 1
+            
+            # Save accumulated likelihood results
+            acc_json_fname = osp.join(layer_acc_folder, f"{idx}_{k}-layer_acc.json")
+            acc_data = {
+                "pred_d16": pred_d16_acc.item(),
+                "pred_d30": pred_d30_acc.item(),
+                "label": label.item(),
+                "target_log_likelihood_d16": acc_log_likelihoods_d16[k][label.item()].item(),
+                "target_log_likelihood_d30": acc_log_likelihoods_d30[k][label.item()].item(),
+                "log_likelihood_d16": acc_log_likelihoods_d16[k].detach().cpu().tolist(),
+                "log_likelihood_d30": acc_log_likelihoods_d30[k].detach().cpu().tolist(),
+            }
+            with open(acc_json_fname, "w") as f:
+                json.dump(acc_data, f, indent=4)
+        
+        # Calculate overall predictions
         pred_d16 = torch.argmax(log_likelihood_list_d16[:-1])
         pred_d30 = torch.argmax(log_likelihood_list_d30[:-1])
 
-        # Update accuracies for both models
+        # Update overall accuracies
         if pred_d16.item() == label.item():
             correct_d16 += 1
         total_d16 += 1
@@ -309,9 +418,22 @@ def main():
     plt.close()
     # ---------------------------------------------------------
 
+    print("\nOverall Accuracies:")
     print(f"Overall Accuracy (d16): {100 * correct_d16 / total_d16:.2f}%")
     print(f"Overall Accuracy (d30): {100 * correct_d30 / total_d30:.2f}%")
     print(f"Overall Accuracy (original): {100 * correct / total:.2f}%")
+    
+    print("\nPer-Scale Accuracies:")
+    for scale_idx in range(len(patch_nums)):
+        print(f"\nScale {scale_idx} (patch size: {patch_nums[scale_idx]}):")
+        print(f"  d16 Accuracy: {100 * scale_correct_d16[scale_idx] / scale_total_d16[scale_idx]:.2f}%")
+        print(f"  d30 Accuracy: {100 * scale_correct_d30[scale_idx] / scale_total_d30[scale_idx]:.2f}%")
+    
+    print("\nAccumulated Likelihood Accuracies (first k layers):")
+    for k in range(len(patch_nums)):
+        print(f"\nFirst {k+1} layers:")
+        print(f"  d16 Accuracy: {100 * acc_correct_d16[k] / acc_total_d16[k]:.2f}%")
+        print(f"  d30 Accuracy: {100 * acc_correct_d30[k] / acc_total_d30[k]:.2f}%")
 
 
 if __name__ == "__main__":
