@@ -6,9 +6,13 @@
 #     CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold $threshold
 # done
 
+# for threshold in $(seq 0.2 0.05 0.7); do
+#     CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold $threshold
+# done
 for threshold in $(seq 0.2 0.05 0.7); do
-    CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold $threshold
+    CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 30 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold $threshold
 done
+
 
 
 # CUDA_VISIBLE_DEVICES=7 python eval_prob.py --depth 16 --partial 500 --mode neighbor_bayesian --cfg 0 --threshold 1.0

@@ -1,4 +1,7 @@
-python smoothing.py --cfg 0.0 --threshold 0.2
+# python smoothing.py --cfg 0.0 --threshold 0.08
+# python smoothing.py --cfg 0.0 --threshold 0.1
+# python smoothing.py --cfg 0.0 --threshold 0.2
+# python smoothing.py --cfg 0.0 --threshold 0.3
 python smoothing.py --cfg 0.0 --threshold 0.7
 
 # python smoothing.py --cfg 0.0 --threshold 0.75

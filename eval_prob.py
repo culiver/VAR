@@ -219,7 +219,7 @@ def main():
     if args.Clayer:
         name += f"_Clayer[{args.Clayer}]"
     name += f"_cfg[{args.cfg}]"
-    if args.mode == "neighbor_bayesian":
+    if "neighbor_bayesian" in args.mode:
         name += f"_threshold[{args.threshold}]"
 
 
@@ -334,6 +334,12 @@ def main():
     correct = 0
     total = 0
     pbar = tqdm.tqdm(ld_val)
+    if args.mode == "fast_neighbor_bayesian":
+        emb_weight = vae.quantize.embedding.weight  # (V, D)
+        dists = torch.cdist(emb_weight, emb_weight, p=2)  # (V, V)
+        neighbors = torch.argsort(dists, dim=1)  # (V, V) - tokens sorted by increasing distance.
+        top_n_neighbors = neighbors[:, :]  # (V, n)
+        
     for idx, (img, label) in enumerate(pbar):
         if args.partial is not None and idx >= args.partial:
             break
@@ -496,6 +502,36 @@ def main():
                 elif args.mode == "neighbor_bayesian":
                     smoothed_output, log_likelihood, _ = var.smooth_sampling(gt_tokens, n=4096, cfg=args.cfg, label=class_labels[0], g_seed=seed, neighbor_threshold=args.threshold)
                     likelihood_list.append(log_likelihood.unsqueeze(0))
+                
+                elif args.mode == "fast_neighbor_bayesian":
+                                        # Prepare the teacher forcing input (excluding the first tokens)
+                    # Here, we assume the same function is used as during training.
+                    x_BLCv_wo_first_l = vae.quantize.idxBl_to_var_input(gt_idx_list)
+
+                    # Pass through the forward method to get logits for each token position.
+                    # The forward method uses teacher forcing, meaning it conditions on the ground truth tokens.
+                    logits = var.forward(
+                        label_B, x_BLCv_wo_first_l
+                    )  # (B, L, V) where V is vocab_size
+
+                    # Compute log probabilities over the vocabulary.
+                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
+
+                    
+                    candidate_neighbors_full = top_n_neighbors[gt_tokens]  # (B, cur_L_segment, n)
+                    candidate_dists = torch.gather(
+                        dists[gt_tokens], dim=-1, index=candidate_neighbors_full
+                    )
+                    effective_threshold = args.threshold
+                    # Build mask: valid candidates are those with distance below effective_threshold.
+                    candidate_mask = candidate_dists <= effective_threshold
+                    candidate_log_probs = torch.gather(log_probs, dim=-1, index=candidate_neighbors_full)
+                    candidate_log_probs = candidate_log_probs.masked_fill(~candidate_mask, float("-inf"))
+                    max_vals, max_idx = candidate_log_probs.max(dim=-1)  # (B, cur_L_segment)
+                    
+                    log_likelihood = max_vals.sum(dim=1)  # (B,)
+
+                    likelihood_list.append(log_likelihood)
 
         if args.plot:
             log_prob_list = torch.cat(log_prob_list, dim=0)
