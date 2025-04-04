@@ -100,9 +100,10 @@ def main():
     parser.add_argument("--Clayer", type=int, default=None)
     parser.add_argument("--batch_size", "-b", type=int, default=1)
     parser.add_argument("--plot", action='store_true')
-    parser.add_argument("--mode", type=str, default="bayesian")
+    parser.add_argument("--mode", type=str, default="var")
     parser.add_argument("--feat", type=str, default="dinov2")
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--plot_kde", action='store_true')
     args = parser.parse_args()
     MODEL_DEPTH = args.depth
 
@@ -110,11 +111,9 @@ def main():
     extra = args.extra if args.extra is not None else ""
     if args.depth != 16:
         name += f"_d{args.depth}"
-    if args.mode != "bayesian":
-        name += f"_mode[{args.mode}]"
     name += f"_cfg[{args.cfg}]"
 
-    run_folder = osp.join(LOG_DIR, args.dataset, name) if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, name + f"_{extra}")
+    run_folder = osp.join(LOG_DIR, args.dataset,args.mode, name) if len(extra) == 0 else osp.join(LOG_DIR, args.dataset,args.mode, name + f"_{extra}")
     os.makedirs(run_folder, exist_ok=True)
     
     # Setup standard logging instead of the custom PrintLogger
@@ -287,10 +286,6 @@ def main():
                 class_labels = remaining_classes[: args.batch_size]
                 remaining_classes = remaining_classes[args.batch_size:]
                 label_B = torch.tensor(class_labels, device=device)
-
-                # gt_idx_list = vae.img_to_idxBl(img)
-                # gt_tokens = torch.cat(gt_idx_list, dim=1)
-                # x_BLCv_wo_first_l = vae.quantize.idxBl_to_var_input(gt_idx_list)
 
                 logits_d16 = var_d16.forward(label_B, x_BLCv_wo_first_l)
                 logits_d30 = var_d30.forward(label_B, x_BLCv_wo_first_l)
@@ -484,29 +479,30 @@ def main():
         if pred.item() == label.item():
             correct += 1
         total += 1
-
-    # # ----- Overall KDE Plot: Plot one subplot per class -----
-    # fig, axs = plt.subplots(2, 5, figsize=(20, 8))
-    # for cls in range(10):
-    #     # Concatenate the probabilities for the given class.
-    #     data_d16 = torch.cat(overall_class_probs_d16[cls], dim=0).view(-1).detach().cpu().numpy()
-    #     data_d30 = torch.cat(overall_class_probs_d30[cls], dim=0).view(-1).detach().cpu().numpy()
-    #     kde_d16 = gaussian_kde(data_d16)
-    #     kde_d30 = gaussian_kde(data_d30)
-    #     xmin, xmax = 0, 0.2
-    #     x_vals = np.linspace(xmin, xmax, 1000)
-    #     axs[cls // 5, cls % 5].plot(x_vals, kde_d16(x_vals), label='var_d16')
-    #     axs[cls // 5, cls % 5].plot(x_vals, kde_d30(x_vals), label='var_d30')
-    #     axs[cls // 5, cls % 5].set_title(f'Class {cls}')
-    #     axs[cls // 5, cls % 5].set_xlabel("Value")
-    #     axs[cls // 5, cls % 5].set_ylabel("Density")
-    #     axs[cls // 5, cls % 5].legend()
-    # plt.suptitle("Overall KDE Plot Comparison by Class")
-    # overall_kde_fname = osp.join(run_folder, "overall_kde_by_class.png")
-    # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    # plt.savefig(overall_kde_fname)
-    # plt.close()
-    # ---------------------------------------------------------
+    
+    if args.plot_kde:
+        # ----- Overall KDE Plot: Plot one subplot per class -----
+        fig, axs = plt.subplots(2, 5, figsize=(20, 8))
+        for cls in range(10):
+            # Concatenate the probabilities for the given class.
+            data_d16 = torch.cat(overall_class_probs_d16[cls], dim=0).view(-1).detach().cpu().numpy()
+            data_d30 = torch.cat(overall_class_probs_d30[cls], dim=0).view(-1).detach().cpu().numpy()
+            kde_d16 = gaussian_kde(data_d16)
+            kde_d30 = gaussian_kde(data_d30)
+            xmin, xmax = 0, 0.2
+            x_vals = np.linspace(xmin, xmax, 1000)
+            axs[cls // 5, cls % 5].plot(x_vals, kde_d16(x_vals), label='var_d16')
+            axs[cls // 5, cls % 5].plot(x_vals, kde_d30(x_vals), label='var_d30')
+            axs[cls // 5, cls % 5].set_title(f'Class {cls}')
+            axs[cls // 5, cls % 5].set_xlabel("Value")
+            axs[cls // 5, cls % 5].set_ylabel("Density")
+            axs[cls // 5, cls % 5].legend()
+        plt.suptitle("Overall KDE Plot Comparison by Class")
+        overall_kde_fname = osp.join(run_folder, "overall_kde_by_class.png")
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(overall_kde_fname)
+        plt.close()
+        # ---------------------------------------------------------
 
     logging.info("\nOverall Accuracies:")
     logging.info(f"Overall Accuracy (d16): {100 * correct_d16 / total_d16:.2f}%")
