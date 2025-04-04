@@ -113,7 +113,7 @@ def main():
         name += f"_d{args.depth}"
     name += f"_cfg[{args.cfg}]"
 
-    run_folder = osp.join(LOG_DIR, args.dataset,args.mode, name) if len(extra) == 0 else osp.join(LOG_DIR, args.dataset,args.mode, name + f"_{extra}")
+    run_folder = osp.join(LOG_DIR, args.dataset, args.mode, name) if len(extra) == 0 else osp.join(LOG_DIR, args.dataset,args.mode, name + f"_{extra}")
     os.makedirs(run_folder, exist_ok=True)
     
     # Setup standard logging instead of the custom PrintLogger
@@ -130,13 +130,13 @@ def main():
     logging.info(f"Run folder: {run_folder}")
     logging.info(f"Log file: {log_file}")
 
-    layerwise_folder = osp.join(LOG_DIR, args.dataset, name, "layerwise") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, name + f"_{extra}", "layer_analysis")
+    layerwise_folder = osp.join(LOG_DIR, args.dataset, args.mode, name, "layerwise") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, args.mode, name + f"_{extra}", "layer_analysis")
     os.makedirs(layerwise_folder, exist_ok=True)
 
-    layer_acc_folder = osp.join(LOG_DIR, args.dataset, name, "layer_acc") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, name + f"_{extra}", "layer_acc_analysis")
+    layer_acc_folder = osp.join(LOG_DIR, args.dataset, args.mode, name, "layer_acc") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, args.mode, name + f"_{extra}", "layer_acc_analysis")
     os.makedirs(layer_acc_folder, exist_ok=True)
 
-    layer_cond_folder = osp.join(LOG_DIR, args.dataset, name, "layer_cond") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, name + f"_{extra}", "layer_cond_analysis")
+    layer_cond_folder = osp.join(LOG_DIR, args.dataset, args.mode, name, "layer_cond") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, args.mode, name + f"_{extra}", "layer_cond_analysis")
     os.makedirs(layer_cond_folder, exist_ok=True)
 
     # Build dataset
