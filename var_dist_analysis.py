@@ -29,6 +29,8 @@ import torchvision.models as models
 import torch.nn as nn
 import clip
 from scipy.stats import gaussian_kde
+from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d
 
 MODEL_DEPTH = 16  # TODO: =====> please specify MODEL_DEPTH <=====
 assert MODEL_DEPTH in {16, 20, 24, 30}
@@ -105,6 +107,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--plot_kde", action='store_true')
     parser.add_argument("--top_k", type=int, default=None, help="Number of top probability tokens to consider for L2 distance calculation")
+    parser.add_argument("--plot_dist_kde", action='store_true', help="Plot KDE showing token distance vs. probability relation for each scale")
     args = parser.parse_args()
     MODEL_DEPTH = args.depth
 
@@ -249,6 +252,21 @@ def main():
         if args.top_k is not None:
             logging.info(f"Using top {args.top_k} most probable tokens for L2 distance calculation")
 
+    # For plotting token distance vs. probability relation
+    if args.plot_dist_kde and args.mode == "l2_dist":
+        # For each scale, store distances and probabilities for each sample
+        # Key structure: {sample_idx: {scale_idx: {'distances': [], 'probs': []}}}
+        sample_scale_distances_probs_d16 = {}
+        sample_scale_distances_probs_d30 = {}
+        
+        # For overall plots across samples
+        overall_scale_distances_probs_d16 = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+        overall_scale_distances_probs_d30 = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+        
+        dist_kde_folder = osp.join(LOG_DIR, args.dataset, args.mode, name, "dist_kde") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, args.mode, name + f"_{extra}", "dist_kde_analysis")
+        os.makedirs(dist_kde_folder, exist_ok=True)
+        logging.info(f"Will generate token distance vs. probability plots in: {dist_kde_folder}")
+
     pbar = tqdm.tqdm(ld_val)
     for idx, (img, label) in enumerate(pbar):
         if args.partial is not None and idx >= args.partial:
@@ -319,6 +337,55 @@ def main():
 
                 gt_probs_d16 = probs_d16.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L)
                 gt_probs_d30 = probs_d30.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L)
+
+                # Collect token distances and probabilities for KDE plotting
+                if args.plot_dist_kde and args.mode == "l2_dist":
+                    batch_size = probs_d16.shape[0]
+                    for b in range(batch_size):
+                        # Only collect data for the correct class condition
+                        if class_labels[b] != label.item():
+                            continue
+                            
+                        # Initialize data structure for this sample if needed
+                        if idx not in sample_scale_distances_probs_d16:
+                            sample_scale_distances_probs_d16[idx] = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+                            sample_scale_distances_probs_d30[idx] = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+                            
+                        start_idx = 0
+                        for scale_idx, num_patches in enumerate(patch_nums):
+                            num_patches_square = num_patches * num_patches
+                            end_idx = start_idx + num_patches_square
+                            
+                            # Get ground truth tokens for this scale
+                            scale_gt_tokens = gt_tokens[b, start_idx:end_idx]  # (num_patches_square)
+                            
+                            # Get distances from gt_tokens to all other tokens
+                            scale_gt_distances_d16 = dists_d16[scale_gt_tokens]  # (num_patches_square, V)
+                            scale_gt_distances_d30 = dists_d30[scale_gt_tokens]  # (num_patches_square, V)
+                            
+                            # Get probabilities for this scale
+                            scale_probs_d16 = probs_d16[b, start_idx:end_idx]  # (num_patches_square, V)
+                            scale_probs_d30 = probs_d30[b, start_idx:end_idx]  # (num_patches_square, V)
+                            
+                            # Flatten and collect
+                            flat_distances_d16 = scale_gt_distances_d16.view(-1).detach().cpu().numpy()
+                            flat_probs_d16 = scale_probs_d16.view(-1).detach().cpu().numpy()
+                            flat_distances_d30 = scale_gt_distances_d30.view(-1).detach().cpu().numpy()
+                            flat_probs_d30 = scale_probs_d30.view(-1).detach().cpu().numpy()
+                            
+                            # Store for later plotting
+                            sample_scale_distances_probs_d16[idx][scale_idx]['distances'].append(flat_distances_d16)
+                            sample_scale_distances_probs_d16[idx][scale_idx]['probs'].append(flat_probs_d16)
+                            sample_scale_distances_probs_d30[idx][scale_idx]['distances'].append(flat_distances_d30)
+                            sample_scale_distances_probs_d30[idx][scale_idx]['probs'].append(flat_probs_d30)
+                            
+                            # Also store for overall plots
+                            overall_scale_distances_probs_d16[scale_idx]['distances'].append(flat_distances_d16)
+                            overall_scale_distances_probs_d16[scale_idx]['probs'].append(flat_probs_d16)
+                            overall_scale_distances_probs_d30[scale_idx]['distances'].append(flat_distances_d30)
+                            overall_scale_distances_probs_d30[scale_idx]['probs'].append(flat_probs_d30)
+                            
+                            start_idx = end_idx
 
                 # Append per-sample lists.
                 prob_list_d16.append(gt_probs_d16)
@@ -607,6 +674,349 @@ def main():
         plt.savefig(overall_kde_fname)
         plt.close()
         # ---------------------------------------------------------
+
+    # Plot token distance vs. probability for each scale and sample
+    if args.plot_dist_kde and args.mode == "l2_dist":
+        logging.info(f"Generating token distance vs. probability plots for each sample...")
+        
+        # Helper function to apply smoothing
+        def apply_smoothing(y, method='savgol', window=15, polyorder=3, sigma=2):
+            if method == 'savgol':
+                if len(y) > window:  # Need sufficient points for Savitzky-Golay
+                    return savgol_filter(y, window, polyorder)
+                else:
+                    return gaussian_filter1d(y, sigma)  # Fallback to Gaussian
+            elif method == 'gaussian':
+                return gaussian_filter1d(y, sigma)
+            else:
+                return y  # No smoothing
+        
+        # Process each sample
+        for sample_idx in sample_scale_distances_probs_d16.keys():
+            # For each scale in this sample
+            for scale_idx in range(len(patch_nums)):
+                try:
+                    # Concatenate all collected data for this scale and sample
+                    all_distances_d16 = np.concatenate(sample_scale_distances_probs_d16[sample_idx][scale_idx]['distances'])
+                    all_probs_d16 = np.concatenate(sample_scale_distances_probs_d16[sample_idx][scale_idx]['probs'])
+                    all_distances_d30 = np.concatenate(sample_scale_distances_probs_d30[sample_idx][scale_idx]['distances'])
+                    all_probs_d30 = np.concatenate(sample_scale_distances_probs_d30[sample_idx][scale_idx]['probs'])
+                    
+                    # Create a random subsample if there's too much data
+                    max_points = 100000  # Limit sample size for efficiency
+                    if len(all_distances_d16) > max_points:
+                        indices = np.random.choice(len(all_distances_d16), max_points, replace=False)
+                        all_distances_d16 = all_distances_d16[indices]
+                        all_probs_d16 = all_probs_d16[indices]
+                    
+                    if len(all_distances_d30) > max_points:
+                        indices = np.random.choice(len(all_distances_d30), max_points, replace=False)
+                        all_distances_d30 = all_distances_d30[indices]
+                        all_probs_d30 = all_probs_d30[indices]
+                    
+                    # Filter out extreme values
+                    mask_d16 = (all_probs_d16 > 1e-10) & (all_distances_d16 < 50)
+                    filtered_distances_d16 = all_distances_d16[mask_d16]
+                    filtered_probs_d16 = all_probs_d16[mask_d16]
+                    
+                    mask_d30 = (all_probs_d30 > 1e-10) & (all_distances_d30 < 50)
+                    filtered_distances_d30 = all_distances_d30[mask_d30]
+                    filtered_probs_d30 = all_probs_d30[mask_d30]
+                    
+                    # Create average probability vs. distance plot
+                    plt.figure(figsize=(10, 6))
+                    
+                    # Create distance bins
+                    max_dist = min(max(filtered_distances_d16.max(), filtered_distances_d30.max()), 30)  # Cap at 30 to focus on relevant range
+                    bins = np.linspace(0, max_dist, 100)  # More bins for smoother curve
+                    
+                    # Compute average probability for each bin
+                    avg_probs_d16 = []
+                    avg_probs_d30 = []
+                    bin_centers = []
+                    
+                    for i in range(len(bins)-1):
+                        mask_d16_bin = (filtered_distances_d16 >= bins[i]) & (filtered_distances_d16 < bins[i+1])
+                        mask_d30_bin = (filtered_distances_d30 >= bins[i]) & (filtered_distances_d30 < bins[i+1])
+                        
+                        if np.sum(mask_d16_bin) > 0:
+                            avg_probs_d16.append(np.mean(filtered_probs_d16[mask_d16_bin]))
+                        else:
+                            avg_probs_d16.append(np.nan)
+                            
+                        if np.sum(mask_d30_bin) > 0:
+                            avg_probs_d30.append(np.mean(filtered_probs_d30[mask_d30_bin]))
+                        else:
+                            avg_probs_d30.append(np.nan)
+                            
+                        bin_centers.append((bins[i] + bins[i+1]) / 2)
+                    
+                    # Convert to numpy arrays for easier processing
+                    bin_centers = np.array(bin_centers)
+                    avg_probs_d16 = np.array(avg_probs_d16)
+                    avg_probs_d30 = np.array(avg_probs_d30)
+                    
+                    # Remove NaN values before smoothing
+                    valid_indices_d16 = ~np.isnan(avg_probs_d16)
+                    valid_indices_d30 = ~np.isnan(avg_probs_d30)
+                    
+                    if np.sum(valid_indices_d16) > 5:  # Need enough points for smoothing
+                        # Apply smoothing to average probabilities
+                        smooth_probs_d16 = np.full_like(avg_probs_d16, np.nan)
+                        smooth_probs_d16[valid_indices_d16] = apply_smoothing(
+                            avg_probs_d16[valid_indices_d16], 
+                            method='savgol' if np.sum(valid_indices_d16) > 15 else 'gaussian'
+                        )
+                        
+                        # Plot raw data as scatter and smoothed curve as line
+                        plt.scatter(bin_centers[valid_indices_d16], avg_probs_d16[valid_indices_d16], 
+                                   s=10, alpha=0.4, color='blue', label='VAR D16 (raw)')
+                        plt.plot(bin_centers[valid_indices_d16], smooth_probs_d16[valid_indices_d16], 
+                                'b-', linewidth=2, label='VAR D16 (smoothed)')
+                    
+                    if np.sum(valid_indices_d30) > 5:  # Need enough points for smoothing
+                        # Apply smoothing to average probabilities
+                        smooth_probs_d30 = np.full_like(avg_probs_d30, np.nan)
+                        smooth_probs_d30[valid_indices_d30] = apply_smoothing(
+                            avg_probs_d30[valid_indices_d30], 
+                            method='savgol' if np.sum(valid_indices_d30) > 15 else 'gaussian'
+                        )
+                        
+                        # Plot raw data as scatter and smoothed curve as line
+                        plt.scatter(bin_centers[valid_indices_d30], avg_probs_d30[valid_indices_d30], 
+                                   s=10, alpha=0.4, color='red', label='VAR D30 (raw)')
+                        plt.plot(bin_centers[valid_indices_d30], smooth_probs_d30[valid_indices_d30], 
+                                'r-', linewidth=2, label='VAR D30 (smoothed)')
+                    
+                    plt.xlabel('Token Distance', fontsize=12)
+                    plt.ylabel('Average Probability', fontsize=12)
+                    plt.yscale('log')
+                    plt.title(f'Sample {sample_idx}, Scale {scale_idx} (patches: {patch_nums[scale_idx]}x{patch_nums[scale_idx]})\nAvg Prob vs Distance', fontsize=14)
+                    plt.legend()
+                    plt.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    plt.savefig(osp.join(dist_kde_folder, f"{sample_idx}_{scale_idx}-layer_prob_vs_dist.png"))
+                    plt.close()
+                    
+                except Exception as e:
+                    logging.error(f"Failed to create plot for sample {sample_idx}, scale {scale_idx}: {e}")
+                    continue
+                
+        logging.info(f"Token distance vs. probability plots saved to: {dist_kde_folder}")
+
+        # After processing individual samples, create overall plots across all samples
+        logging.info(f"Generating overall token distance vs. probability plots across all samples...")
+        for scale_idx in range(len(patch_nums)):
+            try:
+                # Concatenate all collected data for this scale across all samples
+                all_distances_d16 = np.concatenate(overall_scale_distances_probs_d16[scale_idx]['distances']) if overall_scale_distances_probs_d16[scale_idx]['distances'] else np.array([])
+                all_probs_d16 = np.concatenate(overall_scale_distances_probs_d16[scale_idx]['probs']) if overall_scale_distances_probs_d16[scale_idx]['probs'] else np.array([])
+                all_distances_d30 = np.concatenate(overall_scale_distances_probs_d30[scale_idx]['distances']) if overall_scale_distances_probs_d30[scale_idx]['distances'] else np.array([])
+                all_probs_d30 = np.concatenate(overall_scale_distances_probs_d30[scale_idx]['probs']) if overall_scale_distances_probs_d30[scale_idx]['probs'] else np.array([])
+                
+                if len(all_distances_d16) == 0 or len(all_distances_d30) == 0:
+                    logging.warning(f"No data collected for scale {scale_idx} overall plot")
+                    continue
+                
+                # Create a random subsample if there's too much data
+                max_points = 500000  # Increased for overall plots
+                if len(all_distances_d16) > max_points:
+                    indices = np.random.choice(len(all_distances_d16), max_points, replace=False)
+                    all_distances_d16 = all_distances_d16[indices]
+                    all_probs_d16 = all_probs_d16[indices]
+                
+                if len(all_distances_d30) > max_points:
+                    indices = np.random.choice(len(all_distances_d30), max_points, replace=False)
+                    all_distances_d30 = all_distances_d30[indices]
+                    all_probs_d30 = all_probs_d30[indices]
+                
+                # Filter out extreme values
+                mask_d16 = (all_probs_d16 > 1e-10) & (all_distances_d16 < 50)
+                filtered_distances_d16 = all_distances_d16[mask_d16]
+                filtered_probs_d16 = all_probs_d16[mask_d16]
+                
+                mask_d30 = (all_probs_d30 > 1e-10) & (all_distances_d30 < 50)
+                filtered_distances_d30 = all_distances_d30[mask_d30]
+                filtered_probs_d30 = all_probs_d30[mask_d30]
+                
+                # Create average probability vs. distance plot
+                plt.figure(figsize=(12, 8))
+                
+                # Create distance bins
+                max_dist = min(max(filtered_distances_d16.max(), filtered_distances_d30.max()), 30)
+                bins = np.linspace(0, max_dist, 150)  # More bins for smoother curve in overall plot
+                
+                # Compute average probability for each bin
+                avg_probs_d16 = []
+                avg_probs_d30 = []
+                bin_centers = []
+                bin_counts_d16 = []  # To track number of points in each bin
+                bin_counts_d30 = []
+                
+                for i in range(len(bins)-1):
+                    mask_d16_bin = (filtered_distances_d16 >= bins[i]) & (filtered_distances_d16 < bins[i+1])
+                    mask_d30_bin = (filtered_distances_d30 >= bins[i]) & (filtered_distances_d30 < bins[i+1])
+                    
+                    bin_count_d16 = np.sum(mask_d16_bin)
+                    bin_count_d30 = np.sum(mask_d30_bin)
+                    
+                    bin_counts_d16.append(bin_count_d16)
+                    bin_counts_d30.append(bin_count_d30)
+                    
+                    if bin_count_d16 > 0:
+                        avg_probs_d16.append(np.mean(filtered_probs_d16[mask_d16_bin]))
+                    else:
+                        avg_probs_d16.append(np.nan)
+                        
+                    if bin_count_d30 > 0:
+                        avg_probs_d30.append(np.mean(filtered_probs_d30[mask_d30_bin]))
+                    else:
+                        avg_probs_d30.append(np.nan)
+                        
+                    bin_centers.append((bins[i] + bins[i+1]) / 2)
+                
+                # Convert to numpy arrays for easier processing
+                bin_centers = np.array(bin_centers)
+                avg_probs_d16 = np.array(avg_probs_d16)
+                avg_probs_d30 = np.array(avg_probs_d30)
+                bin_counts_d16 = np.array(bin_counts_d16)
+                bin_counts_d30 = np.array(bin_counts_d30)
+                
+                # Remove NaN values before smoothing
+                valid_indices_d16 = ~np.isnan(avg_probs_d16)
+                valid_indices_d30 = ~np.isnan(avg_probs_d30)
+                
+                # Main plot
+                if np.sum(valid_indices_d16) > 5:
+                    # Apply smoothing to average probabilities with more points for an overall smoother curve
+                    window = 25 if np.sum(valid_indices_d16) > 50 else 15
+                    smooth_probs_d16 = np.full_like(avg_probs_d16, np.nan)
+                    smooth_probs_d16[valid_indices_d16] = apply_smoothing(
+                        avg_probs_d16[valid_indices_d16], 
+                        method='savgol' if np.sum(valid_indices_d16) > window else 'gaussian',
+                        window=window
+                    )
+                    
+                    # Plot raw data with alpha based on bin count (more points = more opaque)
+                    max_count_d16 = np.max(bin_counts_d16[valid_indices_d16]) if np.sum(valid_indices_d16) > 0 else 1
+                    alphas_d16 = np.minimum(0.7, 0.1 + 0.6 * bin_counts_d16[valid_indices_d16] / max_count_d16)
+                    
+                    # Plot scatter with varying alpha
+                    for i, idx in enumerate(np.where(valid_indices_d16)[0]):
+                        plt.scatter(bin_centers[idx], avg_probs_d16[idx], 
+                                   s=20, alpha=alphas_d16[i], color='blue', edgecolor='none')
+                    
+                    # Plot the smoothed curve
+                    plt.plot(bin_centers[valid_indices_d16], smooth_probs_d16[valid_indices_d16], 
+                            'b-', linewidth=3, label='VAR D16 (smoothed)')
+                
+                if np.sum(valid_indices_d30) > 5:
+                    # Apply smoothing to average probabilities
+                    window = 25 if np.sum(valid_indices_d30) > 50 else 15
+                    smooth_probs_d30 = np.full_like(avg_probs_d30, np.nan)
+                    smooth_probs_d30[valid_indices_d30] = apply_smoothing(
+                        avg_probs_d30[valid_indices_d30], 
+                        method='savgol' if np.sum(valid_indices_d30) > window else 'gaussian',
+                        window=window
+                    )
+                    
+                    # Plot raw data with alpha based on bin count
+                    max_count_d30 = np.max(bin_counts_d30[valid_indices_d30]) if np.sum(valid_indices_d30) > 0 else 1
+                    alphas_d30 = np.minimum(0.7, 0.1 + 0.6 * bin_counts_d30[valid_indices_d30] / max_count_d30)
+                    
+                    # Plot scatter with varying alpha
+                    for i, idx in enumerate(np.where(valid_indices_d30)[0]):
+                        plt.scatter(bin_centers[idx], avg_probs_d30[idx], 
+                                   s=20, alpha=alphas_d30[i], color='red', edgecolor='none')
+                    
+                    # Plot the smoothed curve
+                    plt.plot(bin_centers[valid_indices_d30], smooth_probs_d30[valid_indices_d30], 
+                            'r-', linewidth=3, label='VAR D30 (smoothed)')
+                
+                # Add a fit line showing expected exponential relationship for reference
+                if np.sum(valid_indices_d16) > 10:
+                    # Create reference exponential decay curve for comparison
+                    from scipy.optimize import curve_fit
+                    
+                    def exp_decay(x, a, b):
+                        return a * np.exp(-b * x)
+                    
+                    try:
+                        # Get valid data points
+                        x_data = bin_centers[valid_indices_d16]
+                        y_data = avg_probs_d16[valid_indices_d16]
+                        
+                        # Fit exponential decay
+                        popt_d16, _ = curve_fit(exp_decay, x_data, y_data, p0=[y_data[0], 0.5], maxfev=2000)
+                        
+                        # Plot fitted curve
+                        x_fit = np.linspace(0, max_dist, 1000)
+                        y_fit = exp_decay(x_fit, *popt_d16)
+                        plt.plot(x_fit, y_fit, 'b--', linewidth=1.5, alpha=0.7, 
+                                label=f'Exp fit D16: {popt_d16[0]:.2e}·exp(-{popt_d16[1]:.2f}·x)')
+                    except Exception as e:
+                        logging.warning(f"Could not fit exponential curve for D16: {e}")
+                
+                if np.sum(valid_indices_d30) > 10:
+                    try:
+                        # Get valid data points
+                        x_data = bin_centers[valid_indices_d30]
+                        y_data = avg_probs_d30[valid_indices_d30]
+                        
+                        # Fit exponential decay
+                        popt_d30, _ = curve_fit(exp_decay, x_data, y_data, p0=[y_data[0], 0.5], maxfev=2000)
+                        
+                        # Plot fitted curve
+                        x_fit = np.linspace(0, max_dist, 1000)
+                        y_fit = exp_decay(x_fit, *popt_d30)
+                        plt.plot(x_fit, y_fit, 'r--', linewidth=1.5, alpha=0.7, 
+                                label=f'Exp fit D30: {popt_d30[0]:.2e}·exp(-{popt_d30[1]:.2f}·x)')
+                    except Exception as e:
+                        logging.warning(f"Could not fit exponential curve for D30: {e}")
+                
+                plt.xlabel('Token Distance', fontsize=14)
+                plt.ylabel('Average Probability', fontsize=14)
+                plt.yscale('log')
+                plt.title(f'Overall Scale {scale_idx} (patches: {patch_nums[scale_idx]}x{patch_nums[scale_idx]})\nAvg Prob vs Distance Across All Samples', fontsize=16)
+                plt.legend(fontsize=12)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(osp.join(dist_kde_folder, f"overall_{scale_idx}-layer_prob_vs_dist.png"), dpi=300)
+                plt.close()
+                
+                # Create a second plot showing data density heatmap
+                try:
+                    plt.figure(figsize=(12, 8))
+                    
+                    # Create 2D histograms
+                    h_d16 = plt.hist2d(filtered_distances_d16, np.log10(filtered_probs_d16), 
+                                      bins=[150, 100], cmap='Blues', alpha=0.6, density=True)
+                    
+                    # Overlay with the smoothed average probability curves
+                    if np.sum(valid_indices_d16) > 5:
+                        plt.plot(bin_centers[valid_indices_d16], np.log10(smooth_probs_d16[valid_indices_d16]), 
+                                'b-', linewidth=3, label='VAR D16 (smoothed)')
+                    
+                    if np.sum(valid_indices_d30) > 5:
+                        plt.plot(bin_centers[valid_indices_d30], np.log10(smooth_probs_d30[valid_indices_d30]), 
+                                'r-', linewidth=3, label='VAR D30 (smoothed)')
+                    
+                    plt.colorbar(h_d16[3], label='Normalized Density')
+                    plt.xlabel('Token Distance', fontsize=14)
+                    plt.ylabel('Log10(Probability)', fontsize=14)
+                    plt.title(f'Overall Scale {scale_idx} (patches: {patch_nums[scale_idx]}x{patch_nums[scale_idx]})\nData Density Heatmap', fontsize=16)
+                    plt.legend(fontsize=12)
+                    plt.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    plt.savefig(osp.join(dist_kde_folder, f"overall_{scale_idx}-layer_density_heatmap.png"), dpi=300)
+                    plt.close()
+                    
+                except Exception as e:
+                    logging.error(f"Failed to create density heatmap for scale {scale_idx}: {e}")
+                
+            except Exception as e:
+                logging.error(f"Failed to create overall plot for scale {scale_idx}: {e}")
+                continue
 
     metric_name = "Average L2 Distance" if args.mode == "l2_dist" else "Log Likelihood"
     logging.info(f"\nOverall Accuracies using {metric_name} for Classification:")
