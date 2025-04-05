@@ -5,6 +5,8 @@ import torch, torchvision
 import random
 import numpy as np
 import PIL.Image as PImage, PIL.ImageDraw as PImageDraw
+import logging
+import sys
 
 setattr(
     torch.nn.Linear, "reset_parameters", lambda self: None
@@ -167,6 +169,69 @@ def create_heatmaps_for_classes(probs: torch.Tensor, patch_nums: list, input_img
     return overlaid_images
 
 
+def setup_logging(run_folder):
+    """Setup logging configuration"""
+    log_file = osp.join(run_folder, "analysis.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return log_file
+
+def download_checkpoints(hf_home, vae_ckpt, var_ckpt):
+    """Download model checkpoints if they don't exist"""
+    if not osp.exists(vae_ckpt):
+        logging.info(f"Downloading VAE checkpoint from {hf_home}/{vae_ckpt}")
+        os.system(f"wget {hf_home}/{vae_ckpt}")
+    if not osp.exists(var_ckpt):
+        logging.info(f"Downloading VAR checkpoint from {hf_home}/{var_ckpt}")
+        os.system(f"wget {hf_home}/{var_ckpt}")
+
+def setup_models(device, patch_nums, num_classes, depth):
+    """Setup and load VAE and VAR models"""
+    vae, var = build_vae_var(
+        V=4096,
+        Cvae=32,
+        ch=160,
+        share_quant_resi=4,
+        device=device,
+        patch_nums=patch_nums,
+        num_classes=num_classes,
+        depth=depth,
+        shared_aln=False,
+    )
+    return vae, var
+
+def load_checkpoints(vae, var, vae_ckpt, var_ckpt):
+    """Load model checkpoints and set models to eval mode"""
+    vae.load_state_dict(torch.load(vae_ckpt, map_location="cpu"), strict=True)
+    var.load_state_dict(torch.load(var_ckpt, map_location="cpu"), strict=True)
+    vae.eval(), var.eval()
+    for p in vae.parameters():
+        p.requires_grad_(False)
+    for p in var.parameters():
+        p.requires_grad_(False)
+    logging.info("Models loaded and set to eval mode")
+    var.cond_drop_rate = 0
+
+def setup_seed(seed):
+    """Setup random seed for reproducibility"""
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def setup_tf32(tf32=True):
+    """Setup TF32 precision"""
+    torch.backends.cudnn.allow_tf32 = bool(tf32)
+    torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
+    torch.set_float32_matmul_precision("high" if tf32 else "highest")
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -229,7 +294,9 @@ def main():
         else osp.join(LOG_DIR, args.dataset, name + f"_{extra}")
     )
     os.makedirs(run_folder, exist_ok=True)
-    print(f"Run folder: {run_folder}")
+    log_file = setup_logging(run_folder)
+    logging.info(f"Run folder: {run_folder}")
+    logging.info(f"Log file: {log_file}")
 
     # Build dataset
     num_classes, dataset_train, dataset_val = build_dataset(
@@ -247,41 +314,27 @@ def main():
     )
     del dataset_val
 
-    # download checkpoint
+    # Download and setup models
     hf_home = "https://huggingface.co/FoundationVision/var/resolve/main"
     vae_ckpt, var_ckpt = "vae_ch160v4096z32.pth", f"var_d{args.depth}.pth"
-    if not osp.exists(vae_ckpt):
-        os.system(f"wget {hf_home}/{vae_ckpt}")
-    if not osp.exists(var_ckpt):
-        os.system(f"wget {hf_home}/{var_ckpt}")
+    download_checkpoints(hf_home, vae_ckpt, var_ckpt)
 
-    # build vae, var
+    # Build and load models
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
     patch_nums_square_cumsum = np.cumsum(np.array(patch_nums)**2)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if "vae" not in globals() or "var" not in globals():
-        vae, var = build_vae_var(
-            V=4096,
-            Cvae=32,
-            ch=160,
-            share_quant_resi=4,  # hard-coded VQVAE hyperparameters
-            device=device,
-            patch_nums=patch_nums,
-            num_classes=1000,
-            depth=MODEL_DEPTH,
-            shared_aln=False,
-        )
+    vae, var = setup_models(device, patch_nums, num_classes, MODEL_DEPTH)
+    load_checkpoints(vae, var, vae_ckpt, var_ckpt)
 
-    # load checkpoints
-    vae.load_state_dict(torch.load(vae_ckpt, map_location="cpu"), strict=True)
-    var.load_state_dict(torch.load(var_ckpt, map_location="cpu"), strict=True)
-    vae.eval(), var.eval()
-    for p in vae.parameters():
-        p.requires_grad_(False)
-    for p in var.parameters():
-        p.requires_grad_(False)
-    print(f"prepare finished.")
+    # Setup seed and precision
+    setup_seed(0)
+    setup_tf32(True)
+
+    # Initialize counters
+    correct = 0
+    total = 0
+    pbar = tqdm.tqdm(ld_val)
 
     if args.mode == "gen":
         old_mean = 0.5
@@ -306,7 +359,6 @@ def main():
             new_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).to(device)
             feature_extractor = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14")
             feature_extractor.to(device)
-
 
     ############################# 2. Sample with classifier-free guidance
 
@@ -364,6 +416,10 @@ def main():
             continue
         with torch.inference_mode():
             # with torch.autocast('cuda', enabled=True, dtype=torch.float16, cache_enabled=True):    # using bfloat16 can be faster
+            # Convert the image to its latent representation (list of token indices)
+            gt_idx_list = vae.img_to_idxBl(img)  # List of tensors for each stage
+            # Convert the image to its latent representation (list of token indices)
+            gt_tokens = torch.cat(gt_idx_list, dim=1)
             while len(remaining_classes) > 0:
                 class_labels = remaining_classes[: args.batch_size]
                 remaining_classes = (
@@ -373,11 +429,7 @@ def main():
                 )
 
                 label_B: torch.LongTensor = torch.tensor(class_labels, device=device)
-
-                # Convert the image to its latent representation (list of token indices)
-                gt_idx_list = vae.img_to_idxBl(img)  # List of tensors for each stage
-                # Convert the image to its latent representation (list of token indices)
-                gt_tokens = torch.cat(gt_idx_list, dim=1)
+                
                 if args.mode == "bayesian":
                     # Prepare the teacher forcing input (excluding the first tokens)
                     # Here, we assume the same function is used as during training.
@@ -385,6 +437,7 @@ def main():
 
                     # Pass through the forward method to get logits for each token position.
                     # The forward method uses teacher forcing, meaning it conditions on the ground truth tokens.
+                    assert var.cond_drop_rate == 0
                     logits = var.forward(
                         label_B, x_BLCv_wo_first_l
                     )  # (B, L, V) where V is vocab_size
@@ -514,9 +567,6 @@ def main():
                         label_B, x_BLCv_wo_first_l
                     )  # (B, L, V) where V is vocab_size
 
-                    # Compute log probabilities over the vocabulary.
-                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
-
                     
                     candidate_neighbors_full = top_n_neighbors[gt_tokens]  # (B, cur_L_segment, n)
                     candidate_dists = torch.gather(
@@ -555,6 +605,8 @@ def main():
         if pred.item() == label.item():
             correct += 1
         total += 1
+
+    logging.info(f"Final accuracy: {100 * correct / total:.2f}%")
 
 
 if __name__ == "__main__":

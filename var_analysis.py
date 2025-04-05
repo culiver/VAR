@@ -182,7 +182,7 @@ def main():
     for p in var_d30.parameters():
         p.requires_grad_(False)
     logging.info("prepare finished.")
-    var_d16.Cond_drop_rate = 0
+    var_d16.cond_drop_rate = 0
     var_d30.cond_drop_rate = 0
 
     ############################# 2. Sample with classifier-free guidance
