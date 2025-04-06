@@ -92,8 +92,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # dataset args
-    parser.add_argument("--dataset", type=str, default="imagenet", choices=["imagenet"], help="Dataset to use")
-    parser.add_argument("--data_path", type=str, default="./datasets/imagenet", help="Data path")
+    parser.add_argument("--dataset", type=str, default="imagenet10", choices=["imagenet10", "imagenet", "imagenet-a"], help="Dataset to use")
     parser.add_argument("--split", type=str, default="test", choices=["train", "test"], help="Name of split")
     parser.add_argument("--extra", type=str, default=None, help="to add to the dataset name")
     parser.add_argument("--partial", type=int, default=200)
@@ -146,7 +145,21 @@ def main():
     os.makedirs(layer_cond_folder, exist_ok=True)
 
     # Build dataset
-    num_classes, dataset_train, dataset_val = build_dataset(args.data_path, final_reso=256, hflip=False)
+    data_path = f"./datasets/{args.dataset}"
+    if args.dataset == "imagenet-a":
+        num_classes, _, dataset_val, class_indices = build_dataset(
+            data_path=data_path,
+            final_reso=256,
+            dataset_type=args.dataset
+        )
+    else:
+        num_classes, _, dataset_val = build_dataset(
+            data_path=data_path,
+            final_reso=256,
+            dataset_type=args.dataset
+        )
+        class_indices = [i for i in range(num_classes)]
+    
     ld_val = DataLoader(dataset_val, num_workers=0, pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
     del dataset_val
 
@@ -235,8 +248,16 @@ def main():
     cond_total_d30 = {scale_idx: 0 for scale_idx in range(len(patch_nums))}
 
     # Dictionaries to store probabilities across all samples per class.
-    overall_class_probs_d16 = {cls: [] for cls in [i for i in range(num_classes)][:10] + [1000]}
-    overall_class_probs_d30 = {cls: [] for cls in [i for i in range(num_classes)][:10] + [1000]}
+    if args.dataset == "imagenet-10":
+        overall_class_probs_d16 = {cls: [] for cls in [i for i in range(num_classes)][:10] + [1000]}
+        overall_class_probs_d30 = {cls: [] for cls in [i for i in range(num_classes)][:10] + [1000]}
+    elif args.dataset == "imagenet-a":
+        # For ImageNet-A, use the actual class indices plus the unconditional class (1000)
+        overall_class_probs_d16 = {cls: [] for cls in class_indices + [1000]}
+        overall_class_probs_d30 = {cls: [] for cls in class_indices + [1000]}
+    else:
+        overall_class_probs_d16 = {cls: [] for cls in [i for i in range(num_classes)] + [1000]}
+        overall_class_probs_d30 = {cls: [] for cls in [i for i in range(num_classes)] + [1000]}
     
     # Precompute embedding distances if using l2_dist mode
     if args.mode == "l2_dist":
@@ -287,7 +308,13 @@ def main():
             pbar.set_description(f"Acc: {100 * correct / total:.2f}%")
         img = img.to(device)            
         # List of classes to process for this sample.
-        remaining_classes = [i for i in range(num_classes)][:10] + [1000]
+        if args.dataset == "imagenet-10":
+            remaining_classes = [i for i in range(num_classes)][:10] + [1000]
+        elif args.dataset == "imagenet-a":
+            # For ImageNet-A, use the actual class indices plus the unconditional class (1000)
+            remaining_classes = class_indices + [1000]
+        else:
+            remaining_classes = [i for i in range(num_classes)] + [1000]
         log_likelihood_list_d16 = []
         log_likelihood_list_d30 = []
         # For per-sample plotting if needed.
@@ -580,8 +607,16 @@ def main():
             scale_log_likelihoods_d16[scale_idx] = torch.cat(scale_log_likelihoods_d16[scale_idx], dim=0)
             scale_log_likelihoods_d30[scale_idx] = torch.cat(scale_log_likelihoods_d30[scale_idx], dim=0)
             
-            pred_d16_scale = torch.argmax(scale_log_likelihoods_d16[scale_idx][:-1])
-            pred_d30_scale = torch.argmax(scale_log_likelihoods_d30[scale_idx][:-1])
+            pred_idx_d16_scale = torch.argmax(scale_log_likelihoods_d16[scale_idx][:-1])
+            pred_idx_d30_scale = torch.argmax(scale_log_likelihoods_d30[scale_idx][:-1])
+            
+            # For ImageNet-A, map the prediction index to the actual class index
+            if args.dataset == "imagenet-a":
+                pred_d16_scale = torch.tensor(class_indices[pred_idx_d16_scale.item()], device=pred_idx_d16_scale.device)
+                pred_d30_scale = torch.tensor(class_indices[pred_idx_d30_scale.item()], device=pred_idx_d30_scale.device)
+            else:
+                pred_d16_scale = pred_idx_d16_scale
+                pred_d30_scale = pred_idx_d30_scale
             
             # Update accuracies for this scale
             if pred_d16_scale.item() == label.item():
@@ -596,9 +631,11 @@ def main():
             scale_data = {
                 "pred_d16": pred_d16_scale.item(),
                 "pred_d30": pred_d30_scale.item(),
+                "pred_idx_d16": pred_idx_d16_scale.item() if args.dataset == "imagenet-a" else None,
+                "pred_idx_d30": pred_idx_d30_scale.item() if args.dataset == "imagenet-a" else None,
                 "label": label.item(),
-                "target_log_likelihood_d16": scale_log_likelihoods_d16[scale_idx][label.item()].item(),
-                "target_log_likelihood_d30": scale_log_likelihoods_d30[scale_idx][label.item()].item(),
+                "target_log_likelihood_d16": scale_log_likelihoods_d16[scale_idx][label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
+                "target_log_likelihood_d30": scale_log_likelihoods_d30[scale_idx][label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
                 "log_likelihood_d16": scale_log_likelihoods_d16[scale_idx].detach().cpu().tolist(),
                 "log_likelihood_d30": scale_log_likelihoods_d30[scale_idx].detach().cpu().tolist(),
                 "metric_type": "negative_l2_distance" if args.mode == "l2_dist" else "log_likelihood",
@@ -613,8 +650,16 @@ def main():
             acc_log_likelihoods_d16[scale_idx] = torch.cat(acc_log_likelihoods_d16[scale_idx], dim=0)
             acc_log_likelihoods_d30[scale_idx] = torch.cat(acc_log_likelihoods_d30[scale_idx], dim=0)
             
-            pred_d16_acc = torch.argmax(acc_log_likelihoods_d16[scale_idx][:-1])
-            pred_d30_acc = torch.argmax(acc_log_likelihoods_d30[scale_idx][:-1])
+            pred_idx_d16_acc = torch.argmax(acc_log_likelihoods_d16[scale_idx][:-1])
+            pred_idx_d30_acc = torch.argmax(acc_log_likelihoods_d30[scale_idx][:-1])
+            
+            # For ImageNet-A, map the prediction index to the actual class index
+            if args.dataset == "imagenet-a":
+                pred_d16_acc = torch.tensor(class_indices[pred_idx_d16_acc.item()], device=pred_idx_d16_acc.device)
+                pred_d30_acc = torch.tensor(class_indices[pred_idx_d30_acc.item()], device=pred_idx_d30_acc.device)
+            else:
+                pred_d16_acc = pred_idx_d16_acc
+                pred_d30_acc = pred_idx_d30_acc
             
             # Update accuracies for accumulated likelihoods
             if pred_d16_acc.item() == label.item():
@@ -629,9 +674,11 @@ def main():
             acc_data = {
                 "pred_d16": pred_d16_acc.item(),
                 "pred_d30": pred_d30_acc.item(),
+                "pred_idx_d16": pred_idx_d16_acc.item() if args.dataset == "imagenet-a" else None,
+                "pred_idx_d30": pred_idx_d30_acc.item() if args.dataset == "imagenet-a" else None,
                 "label": label.item(),
-                "target_log_likelihood_d16": acc_log_likelihoods_d16[scale_idx][label.item()].item(),
-                "target_log_likelihood_d30": acc_log_likelihoods_d30[scale_idx][label.item()].item(),
+                "target_log_likelihood_d16": acc_log_likelihoods_d16[scale_idx][label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
+                "target_log_likelihood_d30": acc_log_likelihoods_d30[scale_idx][label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
                 "log_likelihood_d16": acc_log_likelihoods_d16[scale_idx].detach().cpu().tolist(),
                 "log_likelihood_d30": acc_log_likelihoods_d30[scale_idx].detach().cpu().tolist(),
                 "metric_type": "negative_l2_distance" if args.mode == "l2_dist" else "log_likelihood",
@@ -648,8 +695,16 @@ def main():
             cond_log_likelihoods_d30[scale_idx] = torch.cat(cond_log_likelihoods_d30[scale_idx], dim=0)
             
             # Make predictions based on conditional likelihoods
-            pred_d16_cond = torch.argmax(cond_log_likelihoods_d16[scale_idx][:-1])
-            pred_d30_cond = torch.argmax(cond_log_likelihoods_d30[scale_idx][:-1])
+            pred_idx_d16_cond = torch.argmax(cond_log_likelihoods_d16[scale_idx][:-1])
+            pred_idx_d30_cond = torch.argmax(cond_log_likelihoods_d30[scale_idx][:-1])
+            
+            # For ImageNet-A, map the prediction index to the actual class index
+            if args.dataset == "imagenet-a":
+                pred_d16_cond = torch.tensor(class_indices[pred_idx_d16_cond.item()], device=pred_idx_d16_cond.device)
+                pred_d30_cond = torch.tensor(class_indices[pred_idx_d30_cond.item()], device=pred_idx_d30_cond.device)
+            else:
+                pred_d16_cond = pred_idx_d16_cond
+                pred_d30_cond = pred_idx_d30_cond
             
             # Update conditional accuracies
             if pred_d16_cond.item() == label.item():
@@ -664,9 +719,11 @@ def main():
             cond_data = {
                 "pred_d16": pred_d16_cond.item(),
                 "pred_d30": pred_d30_cond.item(),
+                "pred_idx_d16": pred_idx_d16_cond.item() if args.dataset == "imagenet-a" else None,
+                "pred_idx_d30": pred_idx_d30_cond.item() if args.dataset == "imagenet-a" else None,
                 "label": label.item(),
-                "target_log_likelihood_d16": cond_log_likelihoods_d16[scale_idx][label.item()].item(),
-                "target_log_likelihood_d30": cond_log_likelihoods_d30[scale_idx][label.item()].item(),
+                "target_log_likelihood_d16": cond_log_likelihoods_d16[scale_idx][label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
+                "target_log_likelihood_d30": cond_log_likelihoods_d30[scale_idx][label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
                 "log_likelihood_d16": cond_log_likelihoods_d16[scale_idx].detach().cpu().tolist(),
                 "log_likelihood_d30": cond_log_likelihoods_d30[scale_idx].detach().cpu().tolist(),
                 "metric_type": "negative_l2_distance" if args.mode == "l2_dist" else "log_likelihood",
@@ -677,8 +734,16 @@ def main():
                 json.dump(cond_data, f, indent=4)
         
         # Calculate overall predictions
-        pred_d16 = torch.argmax(log_likelihood_list_d16[:-1])
-        pred_d30 = torch.argmax(log_likelihood_list_d30[:-1])
+        pred_idx_d16 = torch.argmax(log_likelihood_list_d16[:-1])
+        pred_idx_d30 = torch.argmax(log_likelihood_list_d30[:-1])
+        
+        # For ImageNet-A, map the prediction index to the actual class index
+        if args.dataset == "imagenet-a":
+            pred_d16 = torch.tensor(class_indices[pred_idx_d16.item()], device=pred_idx_d16.device)
+            pred_d30 = torch.tensor(class_indices[pred_idx_d30.item()], device=pred_idx_d30.device)
+        else:
+            pred_d16 = pred_idx_d16
+            pred_d30 = pred_idx_d30
 
         # Update overall accuracies
         if pred_d16.item() == label.item():
@@ -695,8 +760,10 @@ def main():
             "label": label.item(),
             "pred_d16": pred_d16.item(),
             "pred_d30": pred_d30.item(),
-            "target_log_likelihood_d16": log_likelihood_list_d16[label.item()].item(),
-            "target_log_likelihood_d30": log_likelihood_list_d30[label.item()].item(),
+            "pred_idx_d16": pred_idx_d16.item() if args.dataset == "imagenet-a" else None,  # Store the index for ImageNet-A
+            "pred_idx_d30": pred_idx_d30.item() if args.dataset == "imagenet-a" else None,  # Store the index for ImageNet-A
+            "target_log_likelihood_d16": log_likelihood_list_d16[label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
+            "target_log_likelihood_d30": log_likelihood_list_d30[label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())].item(),
             "log_likelihood_d16": log_likelihood_list_d16.detach().cpu().tolist(),
             "log_likelihood_d30": log_likelihood_list_d30.detach().cpu().tolist(),
             "metric_type": "negative_l2_distance" if args.mode == "l2_dist" else "log_likelihood",
