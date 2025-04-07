@@ -34,7 +34,7 @@ from scipy.ndimage import gaussian_filter1d
 
 MODEL_DEPTH = 16  # TODO: =====> please specify MODEL_DEPTH <=====
 assert MODEL_DEPTH in {16, 20, 24, 30}
-LOG_DIR = "./analysis"
+LOG_DIR = "./model_size_analysis"
 
 def create_heatmaps_for_classes(probs: torch.Tensor, patch_nums: list, input_img: torch.Tensor, alpha: float = 0.5):
     """
