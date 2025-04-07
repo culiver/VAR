@@ -154,9 +154,9 @@ def main():
         )
     else:
         num_classes, _, dataset_val = build_dataset(
-            data_path=data_path,
+            data_path=data_path.replace("imagenet10", "imagenet"),
             final_reso=256,
-            dataset_type=args.dataset
+            dataset_type=args.dataset.replace("imagenet10", "imagenet")
         )
         class_indices = [i for i in range(num_classes)]
     
@@ -248,7 +248,7 @@ def main():
     cond_total_d30 = {scale_idx: 0 for scale_idx in range(len(patch_nums))}
 
     # Dictionaries to store probabilities across all samples per class.
-    if args.dataset == "imagenet-10":
+    if args.dataset == "imagenet10":
         overall_class_probs_d16 = {cls: [] for cls in [i for i in range(num_classes)][:10] + [1000]}
         overall_class_probs_d30 = {cls: [] for cls in [i for i in range(num_classes)][:10] + [1000]}
     elif args.dataset == "imagenet-a":
@@ -308,7 +308,7 @@ def main():
             pbar.set_description(f"Acc: {100 * correct / total:.2f}%")
         img = img.to(device)            
         # List of classes to process for this sample.
-        if args.dataset == "imagenet-10":
+        if args.dataset == "imagenet10":
             remaining_classes = [i for i in range(num_classes)][:10] + [1000]
         elif args.dataset == "imagenet-a":
             # For ImageNet-A, use the actual class indices plus the unconditional class (1000)
