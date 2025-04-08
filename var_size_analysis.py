@@ -258,7 +258,7 @@ def main():
         overall_class_probs_d30 = {cls: [] for cls in [i for i in range(num_classes)] + [1000]}
     
     # Precompute embedding distances if using l2_dist mode
-    if args.mode == "l2_dist":
+    if args.mode == "l2_dist" or args.plot_dist_prob:
         # Get embedding weights from vae model
         emb_weight_d16 = vae.quantize.embedding.weight  # (V, D)
         # Compute pairwise L2 distances between all embeddings
@@ -281,11 +281,27 @@ def main():
         overall_scale_distances_probs_d16_wrong = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
         overall_scale_distances_probs_d30_wrong = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
         
+        # For unconditional class (1000)
+        overall_scale_distances_probs_d16_uncond = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+        overall_scale_distances_probs_d30_uncond = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+        
+        # Track samples for balanced comparison
+        samples_per_scale_d16 = {scale_idx: [] for scale_idx in range(len(patch_nums))}
+        samples_per_scale_d30 = {scale_idx: [] for scale_idx in range(len(patch_nums))}
+        
         # Create folder for unified distance analysis that combines correct and wrong conditions
         dist_analysis_folder = osp.join(LOG_DIR, args.dataset, args.mode, name, "dist_analysis") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, args.mode, name + f"_{extra}", "dist_analysis")
         os.makedirs(dist_analysis_folder, exist_ok=True)
         
+        # Create separate folders for d16 and d30 model analyses
+        dist_analysis_d16_folder = osp.join(LOG_DIR, args.dataset, args.mode, name, "dist_analysis_d16") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, args.mode, name + f"_{extra}", "dist_analysis_d16")
+        dist_analysis_d30_folder = osp.join(LOG_DIR, args.dataset, args.mode, name, "dist_analysis_d30") if len(extra) == 0 else osp.join(LOG_DIR, args.dataset, args.mode, name + f"_{extra}", "dist_analysis_d30")
+        os.makedirs(dist_analysis_d16_folder, exist_ok=True)
+        os.makedirs(dist_analysis_d30_folder, exist_ok=True)
+        
         logging.info(f"Will generate unified token distance vs. probability plots in: {dist_analysis_folder}")
+        logging.info(f"Will generate d16-specific plots in: {dist_analysis_d16_folder}")
+        logging.info(f"Will generate d30-specific plots in: {dist_analysis_d30_folder}")
         
         if args.plot_dist_prob:
             logging.info("Generating distance vs. probability plots...")
@@ -685,24 +701,41 @@ def main():
             mask_d16[label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())] = False
             
             # Find largest element excluding the label position
-            largest_non_target_idx_d16 = torch.argmax(log_likelihood_list_d16[:-1][mask_d16])
+            largest_non_target_idx_d16 = torch.argmax(log_likelihood_list_d16[:-1][mask_d16]).item()
+            # # Convert to actual index
+            # largest_non_target_idx_d16 = torch.arange(len(log_likelihood_list_d16[:-1]))[mask_d16][largest_non_target_idx_d16].item()
             
             # Do the same for d30
             mask_d30 = torch.ones_like(log_likelihood_list_d30[:-1], dtype=torch.bool)
             mask_d30[label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())] = False
             
-            largest_non_target_idx_d30 = torch.argmax(log_likelihood_list_d30[:-1][mask_d30])
+            largest_non_target_idx_d30 = torch.argmax(log_likelihood_list_d30[:-1][mask_d30]).item()
+            # # Convert to actual index
+            # largest_non_target_idx_d30 = torch.arange(len(log_likelihood_list_d30[:-1]))[mask_d30][largest_non_target_idx_d30].item()
 
+            # Index for correct class prediction
+            correct_idx_d16 = label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())
+            correct_idx_d30 = correct_idx_d16
+            
+            # Index for unconditional class
+            uncond_idx = -1  # Last index is the unconditional class (1000)
+            
+            # Track which sample we're adding for this example
+            sample_indices_d16 = (correct_idx_d16, largest_non_target_idx_d16, uncond_idx)
+            sample_indices_d30 = (correct_idx_d30, largest_non_target_idx_d30, uncond_idx)
+            
+            # Store sample data for all three classes (correct, wrong, uncond) for this example
             for scale_idx in range(len(patch_nums)):
-                for attr in ["distances", "probs"]:
-                    for sample in distance_probs_list_d16[pred_idx_d16.item()][scale_idx][attr]:
-                        overall_scale_distances_probs_d16[scale_idx][attr].append(sample)
-                    for sample in distance_probs_list_d30[pred_idx_d30.item()][scale_idx][attr]:
-                        overall_scale_distances_probs_d30[scale_idx][attr].append(sample)
-                    for sample in distance_probs_list_d16[largest_non_target_idx_d16.item()][scale_idx][attr]:
-                        overall_scale_distances_probs_d16_wrong[scale_idx][attr].append(sample)
-                    for sample in distance_probs_list_d30[largest_non_target_idx_d30.item()][scale_idx][attr]:
-                        overall_scale_distances_probs_d30_wrong[scale_idx][attr].append(sample)
+                samples_per_scale_d16[scale_idx].append({
+                    'correct': distance_probs_list_d16[correct_idx_d16][scale_idx],
+                    'wrong': distance_probs_list_d16[largest_non_target_idx_d16][scale_idx],
+                    'uncond': distance_probs_list_d16[uncond_idx][scale_idx]
+                })
+                samples_per_scale_d30[scale_idx].append({
+                    'correct': distance_probs_list_d30[correct_idx_d30][scale_idx],
+                    'wrong': distance_probs_list_d30[largest_non_target_idx_d30][scale_idx],
+                    'uncond': distance_probs_list_d30[uncond_idx][scale_idx]
+                })
 
 
         # For ImageNet-A, map the prediction index to the actual class index
@@ -771,78 +804,155 @@ def main():
     if args.plot_dist_prob:
         logging.info(f"Generating token distance vs. probability plots for each sample...")
         
-        # Generate unified plots combining correct and wrong conditions
-        logging.info(f"Generating unified token distance vs. probability plots comparing correct and wrong conditions...")
+        # Use the balanced samples for plotting
         for scale_idx in range(len(patch_nums)):
             try:
-                # Correct condition data
-                correct_distances_d16 = np.concatenate(overall_scale_distances_probs_d16[scale_idx]['distances']) if overall_scale_distances_probs_d16[scale_idx]['distances'] else np.array([])
-                correct_probs_d16 = np.concatenate(overall_scale_distances_probs_d16[scale_idx]['probs']) if overall_scale_distances_probs_d16[scale_idx]['probs'] else np.array([])
-                correct_distances_d30 = np.concatenate(overall_scale_distances_probs_d30[scale_idx]['distances']) if overall_scale_distances_probs_d30[scale_idx]['distances'] else np.array([])
-                correct_probs_d30 = np.concatenate(overall_scale_distances_probs_d30[scale_idx]['probs']) if overall_scale_distances_probs_d30[scale_idx]['probs'] else np.array([])
+                # Initialize empty lists to collect data from all samples
+                correct_distances_d16 = []
+                correct_probs_d16 = []
+                wrong_distances_d16 = []
+                wrong_probs_d16 = []
+                uncond_distances_d16 = []
+                uncond_probs_d16 = []
                 
-                # Wrong condition data
-                wrong_distances_d16 = np.concatenate(overall_scale_distances_probs_d16_wrong[scale_idx]['distances']) if overall_scale_distances_probs_d16_wrong[scale_idx]['distances'] else np.array([])
-                wrong_probs_d16 = np.concatenate(overall_scale_distances_probs_d16_wrong[scale_idx]['probs']) if overall_scale_distances_probs_d16_wrong[scale_idx]['probs'] else np.array([])
-                wrong_distances_d30 = np.concatenate(overall_scale_distances_probs_d30_wrong[scale_idx]['distances']) if overall_scale_distances_probs_d30_wrong[scale_idx]['distances'] else np.array([])
-                wrong_probs_d30 = np.concatenate(overall_scale_distances_probs_d30_wrong[scale_idx]['probs']) if overall_scale_distances_probs_d30_wrong[scale_idx]['probs'] else np.array([])
+                correct_distances_d30 = []
+                correct_probs_d30 = []
+                wrong_distances_d30 = []
+                wrong_probs_d30 = []
+                uncond_distances_d30 = []
+                uncond_probs_d30 = []
+                
+                # Collect data from each sample, ensuring balanced representation
+                for sample_idx, sample_data_d16 in enumerate(samples_per_scale_d16[scale_idx]):
+                    sample_data_d30 = samples_per_scale_d30[scale_idx][sample_idx]
+                    
+                    # Collect distances and probs for d16
+                    for distances in sample_data_d16['correct']['distances']:
+                        correct_distances_d16.extend(distances)
+                    for probs in sample_data_d16['correct']['probs']:
+                        correct_probs_d16.extend(probs)
+                    
+                    for distances in sample_data_d16['wrong']['distances']:
+                        wrong_distances_d16.extend(distances)
+                    for probs in sample_data_d16['wrong']['probs']:
+                        wrong_probs_d16.extend(probs)
+                    
+                    for distances in sample_data_d16['uncond']['distances']:
+                        uncond_distances_d16.extend(distances)
+                    for probs in sample_data_d16['uncond']['probs']:
+                        uncond_probs_d16.extend(probs)
+                    
+                    # Collect distances and probs for d30
+                    for distances in sample_data_d30['correct']['distances']:
+                        correct_distances_d30.extend(distances)
+                    for probs in sample_data_d30['correct']['probs']:
+                        correct_probs_d30.extend(probs)
+                    
+                    for distances in sample_data_d30['wrong']['distances']:
+                        wrong_distances_d30.extend(distances)
+                    for probs in sample_data_d30['wrong']['probs']:
+                        wrong_probs_d30.extend(probs)
+                    
+                    for distances in sample_data_d30['uncond']['distances']:
+                        uncond_distances_d30.extend(distances)
+                    for probs in sample_data_d30['uncond']['probs']:
+                        uncond_probs_d30.extend(probs)
+                
+                # Convert to numpy arrays
+                correct_distances_d16 = np.array(correct_distances_d16)
+                correct_probs_d16 = np.array(correct_probs_d16)
+                wrong_distances_d16 = np.array(wrong_distances_d16)
+                wrong_probs_d16 = np.array(wrong_probs_d16)
+                uncond_distances_d16 = np.array(uncond_distances_d16)
+                uncond_probs_d16 = np.array(uncond_probs_d16)
+                
+                correct_distances_d30 = np.array(correct_distances_d30)
+                correct_probs_d30 = np.array(correct_probs_d30)
+                wrong_distances_d30 = np.array(wrong_distances_d30)
+                wrong_probs_d30 = np.array(wrong_probs_d30)
+                uncond_distances_d30 = np.array(uncond_distances_d30)
+                uncond_probs_d30 = np.array(uncond_probs_d30)
                 
                 if (len(correct_distances_d16) == 0 or len(correct_distances_d30) == 0 or 
-                    len(wrong_distances_d16) == 0 or len(wrong_distances_d30) == 0):
+                    len(wrong_distances_d16) == 0 or len(wrong_distances_d30) == 0 or
+                    len(uncond_distances_d16) == 0 or len(uncond_distances_d30) == 0):
                     logging.warning(f"Insufficient data for unified plot at scale {scale_idx}")
                     continue
                 
-                # Create a random subsample for efficiency
+                # Create a random subsample for efficiency (use the same random indices for all)
                 max_points = 500000
-                for data, name in [(correct_distances_d16, "correct_d16"), (correct_probs_d16, "correct_probs_d16"),
-                                   (correct_distances_d30, "correct_d30"), (correct_probs_d30, "correct_probs_d30"),
-                                   (wrong_distances_d16, "wrong_d16"), (wrong_probs_d16, "wrong_probs_d16"),
-                                   (wrong_distances_d30, "wrong_d30"), (wrong_probs_d30, "wrong_probs_d30")]:
-                    if len(data) > max_points:
-                        if name.startswith("correct_d16") or name.startswith("correct_probs_d16"):
-                            indices = np.random.choice(len(correct_distances_d16), max_points, replace=False)
-                            correct_distances_d16 = correct_distances_d16[indices]
-                            correct_probs_d16 = correct_probs_d16[indices]
-                        elif name.startswith("correct_d30") or name.startswith("correct_probs_d30"):
-                            indices = np.random.choice(len(correct_distances_d30), max_points, replace=False)
-                            correct_distances_d30 = correct_distances_d30[indices]
-                            correct_probs_d30 = correct_probs_d30[indices]
-                        elif name.startswith("wrong_d16") or name.startswith("wrong_probs_d16"):
-                            indices = np.random.choice(len(wrong_distances_d16), max_points, replace=False)
-                            wrong_distances_d16 = wrong_distances_d16[indices]
-                            wrong_probs_d16 = wrong_probs_d16[indices]
-                        elif name.startswith("wrong_d30") or name.startswith("wrong_probs_d30"):
-                            indices = np.random.choice(len(wrong_distances_d30), max_points, replace=False)
-                            wrong_distances_d30 = wrong_distances_d30[indices]
-                            wrong_probs_d30 = wrong_probs_d30[indices]
+                # For each model, use the same indices for correct, wrong, and uncond
+                if len(correct_distances_d16) > max_points:
+                    indices_d16 = np.random.choice(len(correct_distances_d16), max_points, replace=False)
+                    correct_distances_d16 = correct_distances_d16[indices_d16]
+                    correct_probs_d16 = correct_probs_d16[indices_d16]
+                    
+                    # Make sure wrong and uncond arrays have enough elements
+                    if len(wrong_distances_d16) >= len(indices_d16):
+                        wrong_distances_d16 = wrong_distances_d16[indices_d16]
+                        wrong_probs_d16 = wrong_probs_d16[indices_d16]
+                    
+                    if len(uncond_distances_d16) >= len(indices_d16):
+                        uncond_distances_d16 = uncond_distances_d16[indices_d16]
+                        uncond_probs_d16 = uncond_probs_d16[indices_d16]
                 
-                # Filter out extreme values
-                correct_mask_d16 = (correct_probs_d16 > 1e-10) & (correct_distances_d16 < 50)
-                correct_filtered_distances_d16 = correct_distances_d16[correct_mask_d16]
-                correct_filtered_probs_d16 = correct_probs_d16[correct_mask_d16]
+                if len(correct_distances_d30) > max_points:
+                    indices_d30 = np.random.choice(len(correct_distances_d30), max_points, replace=False)
+                    correct_distances_d30 = correct_distances_d30[indices_d30]
+                    correct_probs_d30 = correct_probs_d30[indices_d30]
+                    
+                    # Make sure wrong and uncond arrays have enough elements
+                    if len(wrong_distances_d30) >= len(indices_d30):
+                        wrong_distances_d30 = wrong_distances_d30[indices_d30]
+                        wrong_probs_d30 = wrong_probs_d30[indices_d30]
+                    
+                    if len(uncond_distances_d30) >= len(indices_d30):
+                        uncond_distances_d30 = uncond_distances_d30[indices_d30]
+                        uncond_probs_d30 = uncond_probs_d30[indices_d30]
                 
-                correct_mask_d30 = (correct_probs_d30 > 1e-10) & (correct_distances_d30 < 50)
-                correct_filtered_distances_d30 = correct_distances_d30[correct_mask_d30]
-                correct_filtered_probs_d30 = correct_probs_d30[correct_mask_d30]
+                # Filter out extreme values - use the same filtering for fair comparison
+                common_mask_d16 = (correct_probs_d16 > 1e-10) & (correct_distances_d16 < 50) & \
+                                  (wrong_probs_d16 > 1e-10) & (wrong_distances_d16 < 50) & \
+                                  (uncond_probs_d16 > 1e-10) & (uncond_distances_d16 < 50)
                 
-                wrong_mask_d16 = (wrong_probs_d16 > 1e-10) & (wrong_distances_d16 < 50)
-                wrong_filtered_distances_d16 = wrong_distances_d16[wrong_mask_d16]
-                wrong_filtered_probs_d16 = wrong_probs_d16[wrong_mask_d16]
+                correct_filtered_distances_d16 = correct_distances_d16[common_mask_d16]
+                correct_filtered_probs_d16 = correct_probs_d16[common_mask_d16]
+                wrong_filtered_distances_d16 = wrong_distances_d16[common_mask_d16]
+                wrong_filtered_probs_d16 = wrong_probs_d16[common_mask_d16]
+                uncond_filtered_distances_d16 = uncond_distances_d16[common_mask_d16]
+                uncond_filtered_probs_d16 = uncond_probs_d16[common_mask_d16]
                 
-                wrong_mask_d30 = (wrong_probs_d30 > 1e-10) & (wrong_distances_d30 < 50)
-                wrong_filtered_distances_d30 = wrong_distances_d30[wrong_mask_d30]
-                wrong_filtered_probs_d30 = wrong_probs_d30[wrong_mask_d30]
+                common_mask_d30 = (correct_probs_d30 > 1e-10) & (correct_distances_d30 < 50) & \
+                                  (wrong_probs_d30 > 1e-10) & (wrong_distances_d30 < 50) & \
+                                  (uncond_probs_d30 > 1e-10) & (uncond_distances_d30 < 50)
+                
+                correct_filtered_distances_d30 = correct_distances_d30[common_mask_d30]
+                correct_filtered_probs_d30 = correct_probs_d30[common_mask_d30]
+                wrong_filtered_distances_d30 = wrong_distances_d30[common_mask_d30]
+                wrong_filtered_probs_d30 = wrong_probs_d30[common_mask_d30]
+                uncond_filtered_distances_d30 = uncond_distances_d30[common_mask_d30]
+                uncond_filtered_probs_d30 = uncond_probs_d30[common_mask_d30]
                 
                 # Create unified plot
                 plt.figure(figsize=(15, 10))
                 
-                # Create distance bins
-                max_correct_dist = max(np.max(correct_filtered_distances_d16), np.max(correct_filtered_distances_d30))
-                max_wrong_dist = max(np.max(wrong_filtered_distances_d16), np.max(wrong_filtered_distances_d30))
-                max_dist = min(max(max_correct_dist, max_wrong_dist), 30)
+                # Create common distance bins for all curves
+                max_dist_d16 = max(
+                    np.max(correct_filtered_distances_d16) if len(correct_filtered_distances_d16) > 0 else 0,
+                    np.max(wrong_filtered_distances_d16) if len(wrong_filtered_distances_d16) > 0 else 0,
+                    np.max(uncond_filtered_distances_d16) if len(uncond_filtered_distances_d16) > 0 else 0
+                )
+                
+                max_dist_d30 = max(
+                    np.max(correct_filtered_distances_d30) if len(correct_filtered_distances_d30) > 0 else 0,
+                    np.max(wrong_filtered_distances_d30) if len(wrong_filtered_distances_d30) > 0 else 0,
+                    np.max(uncond_filtered_distances_d30) if len(uncond_filtered_distances_d30) > 0 else 0
+                )
+                
+                max_dist = min(max(max_dist_d16, max_dist_d30), 30)
                 bins = np.linspace(0, max_dist, 150)
                 
-                # Process each condition and model
+                # Process each condition and model with the same binning approach
                 def process_data_for_plot(distances, probs, bins, color, linestyle, marker, label):
                     avg_probs = []
                     bin_centers = []
@@ -883,7 +993,7 @@ def main():
                     
                     return None, None
                 
-                # Process all four combinations
+                # Process all conditions for both models using the same bin ranges
                 correct_centers_d16, correct_values_d16 = process_data_for_plot(
                     correct_filtered_distances_d16, correct_filtered_probs_d16, 
                     bins, 'blue', '-', 'o', 'Correct Class - VAR D16'
@@ -904,21 +1014,92 @@ def main():
                     bins, 'red', '--', 'x', 'Wrong Class - VAR D30'
                 )
                 
+                # Process unconditional data with same bins
+                uncond_centers_d16, uncond_values_d16 = process_data_for_plot(
+                    uncond_filtered_distances_d16, uncond_filtered_probs_d16, 
+                    bins, 'green', '-.', 'v', 'Unconditional - VAR D16'
+                )
+                
+                uncond_centers_d30, uncond_values_d30 = process_data_for_plot(
+                    uncond_filtered_distances_d30, uncond_filtered_probs_d30, 
+                    bins, 'purple', '-.', 'v', 'Unconditional - VAR D30'
+                )
+                
                 plt.xlabel('Token Distance', fontsize=14)
                 plt.ylabel('Average Probability', fontsize=14)
                 plt.yscale('log')
-                plt.title(f'Scale {scale_idx} (patches: {patch_nums[scale_idx]}x{patch_nums[scale_idx]})\nCorrect vs. Wrong Class Condition Comparison', fontsize=16)
+                plt.title(f'Scale {scale_idx} (patches: {patch_nums[scale_idx]}x{patch_nums[scale_idx]})\nBalanced Class Condition Comparison', fontsize=16)
                 plt.legend(fontsize=12)
                 plt.grid(True, alpha=0.3)
                 plt.tight_layout()
                 plt.savefig(osp.join(dist_analysis_folder, f"scale_{scale_idx}_comparison.png"), dpi=300)
                 plt.close()
                 
+                # Create d16-specific plot
+                plt.figure(figsize=(12, 8))
+                
+                # Process only d16 model data
+                correct_centers_d16, correct_values_d16 = process_data_for_plot(
+                    correct_filtered_distances_d16, correct_filtered_probs_d16, 
+                    bins, 'blue', '-', 'o', 'Correct Class'
+                )
+                
+                wrong_centers_d16, wrong_values_d16 = process_data_for_plot(
+                    wrong_filtered_distances_d16, wrong_filtered_probs_d16, 
+                    bins, 'red', '--', 'x', 'Wrong Class'
+                )
+                
+                uncond_centers_d16, uncond_values_d16 = process_data_for_plot(
+                    uncond_filtered_distances_d16, uncond_filtered_probs_d16, 
+                    bins, 'green', '-.', 'v', 'Unconditional'
+                )
+                
+                plt.xlabel('Token Distance', fontsize=14)
+                plt.ylabel('Average Probability', fontsize=14)
+                plt.yscale('log')
+                plt.title(f'VAR D16 - Scale {scale_idx} (patches: {patch_nums[scale_idx]}x{patch_nums[scale_idx]})\nClass Condition Comparison', fontsize=16)
+                plt.legend(fontsize=12)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(osp.join(dist_analysis_d16_folder, f"scale_{scale_idx}_comparison.png"), dpi=300)
+                plt.close()
+                
+                # Create d30-specific plot
+                plt.figure(figsize=(12, 8))
+                
+                # Process only d30 model data
+                correct_centers_d30, correct_values_d30 = process_data_for_plot(
+                    correct_filtered_distances_d30, correct_filtered_probs_d30, 
+                    bins, 'red', '-', 'o', 'Correct Class'
+                )
+                
+                wrong_centers_d30, wrong_values_d30 = process_data_for_plot(
+                    wrong_filtered_distances_d30, wrong_filtered_probs_d30, 
+                    bins, 'blue', '--', 'x', 'Wrong Class'
+                )
+                
+                uncond_centers_d30, uncond_values_d30 = process_data_for_plot(
+                    uncond_filtered_distances_d30, uncond_filtered_probs_d30, 
+                    bins, 'green', '-.', 'v', 'Unconditional'
+                )
+                
+                plt.xlabel('Token Distance', fontsize=14)
+                plt.ylabel('Average Probability', fontsize=14)
+                plt.yscale('log')
+                plt.title(f'VAR D30 - Scale {scale_idx} (patches: {patch_nums[scale_idx]}x{patch_nums[scale_idx]})\nClass Condition Comparison', fontsize=16)
+                plt.legend(fontsize=12)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(osp.join(dist_analysis_d30_folder, f"scale_{scale_idx}_comparison.png"), dpi=300)
+                plt.close()
+                
             except Exception as e:
-                logging.error(f"Failed to create unified plot for scale {scale_idx}: {e}")
+                logging.error(f"Failed to create plots for scale {scale_idx}: {e}")
                 continue
                 
         logging.info(f"Unified token distance vs. probability plots saved to: {dist_analysis_folder}")
+        logging.info(f"D16-specific plots saved to: {dist_analysis_d16_folder}")
+        logging.info(f"D30-specific plots saved to: {dist_analysis_d30_folder}")
 
     metric_name = "Average L2 Distance" if args.mode == "l2_dist" else "Log Likelihood"
     logging.info(f"\nOverall Accuracies using {metric_name} for Classification:")
