@@ -104,7 +104,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--plot_kde", action='store_true')
     parser.add_argument("--top_k", type=int, default=None, help="Number of top probability tokens to consider for L2 distance calculation")
-    parser.add_argument("--plot_dist_kde", action='store_true', help="Plot KDE showing token distance vs. probability relation for each scale")
+    parser.add_argument("--plot_dist_prob", action='store_true', help="Plot KDE showing token distance vs. probability relation for each scale")
     args = parser.parse_args()
     MODEL_DEPTH = args.depth
 
@@ -272,7 +272,7 @@ def main():
             logging.info(f"Using top {args.top_k} most probable tokens for L2 distance calculation")
 
     # For plotting token distance vs. probability relation
-    if args.plot_dist_kde and args.mode == "l2_dist":
+    if args.plot_dist_prob and args.mode == "l2_dist":
         # For each scale, store distances and probabilities for each sample
         # Key structure: {sample_idx: {scale_idx: {'distances': [], 'probs': []}}}
         sample_scale_distances_probs_d16 = {}
@@ -294,7 +294,7 @@ def main():
         
         logging.info(f"Will generate unified token distance vs. probability plots in: {dist_analysis_folder}")
         
-        if args.plot_dist_kde:
+        if args.plot_dist_prob:
             logging.info("Generating distance vs. probability plots...")
             logging.info(f"Creating UNIFIED comparison plots in: {dist_analysis_folder}")
             logging.info("These plots will combine both correct and wrong class condition results for easier comparison.")
@@ -377,7 +377,7 @@ def main():
                 gt_probs_d30 = probs_d30.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L)
 
                 # Collect token distances and probabilities for KDE plotting
-                if args.plot_dist_kde and args.mode == "l2_dist":
+                if args.plot_dist_prob and args.mode == "l2_dist":
                     batch_size = probs_d16.shape[0]
                     for b in range(batch_size):
                         start_idx = 0
@@ -799,7 +799,7 @@ def main():
         # ---------------------------------------------------------
 
     # Plot token distance vs. probability for each scale and sample
-    if args.plot_dist_kde and args.mode == "l2_dist":
+    if args.plot_dist_prob and args.mode == "l2_dist":
         logging.info(f"Generating token distance vs. probability plots for each sample...")
         
         # Generate unified plots combining correct and wrong conditions
