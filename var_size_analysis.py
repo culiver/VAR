@@ -272,19 +272,12 @@ def main():
             logging.info(f"Using top {args.top_k} most probable tokens for L2 distance calculation")
 
     # For plotting token distance vs. probability relation
-    if args.plot_dist_prob and args.mode == "l2_dist":
-        # For each scale, store distances and probabilities for each sample
-        # Key structure: {sample_idx: {scale_idx: {'distances': [], 'probs': []}}}
-        sample_scale_distances_probs_d16 = {}
-        sample_scale_distances_probs_d30 = {}
-        
+    if args.plot_dist_prob:
         # For overall plots across samples
         overall_scale_distances_probs_d16 = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
         overall_scale_distances_probs_d30 = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
         
         # For wrong class condition analysis
-        sample_scale_distances_probs_d16_wrong = {}
-        sample_scale_distances_probs_d30_wrong = {}
         overall_scale_distances_probs_d16_wrong = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
         overall_scale_distances_probs_d30_wrong = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
         
@@ -355,6 +348,9 @@ def main():
                 ratio_list = torch.tensor(ratio_list, device=device)
                 t = args.cfg * ratio_list.unsqueeze(0).unsqueeze(-1)
 
+            if args.plot_dist_prob:
+                distance_probs_list_d16 = []
+                distance_probs_list_d30 = []
             while len(remaining_classes) > 0:
                 # Process a batch of classes.
                 class_labels = remaining_classes[: args.batch_size]
@@ -376,99 +372,46 @@ def main():
                 gt_probs_d16 = probs_d16.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L)
                 gt_probs_d30 = probs_d30.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L)
 
-                # Collect token distances and probabilities for KDE plotting
-                if args.plot_dist_prob and args.mode == "l2_dist":
+                # Collect token distances and probabilities for distance vs. probability plotting
+                if args.plot_dist_prob:
+                    temp_scale_distances_probs_d16 = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+                    temp_scale_distances_probs_d30 = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
+                    
                     batch_size = probs_d16.shape[0]
                     for b in range(batch_size):
                         start_idx = 0
                         
-                        if class_labels[b] == 1000:
-                            continue
+                        for scale_idx, num_patches in enumerate(patch_nums):
+                            num_patches_square = num_patches * num_patches
+                            end_idx = start_idx + num_patches_square
+                            
+                            # Get ground truth tokens for this scale
+                            scale_gt_tokens = gt_tokens[b, start_idx:end_idx]  # (num_patches_square)
+                            
+                            # Get distances from gt_tokens to all other tokens
+                            scale_gt_distances_d16 = dists_d16[scale_gt_tokens]  # (num_patches_square, V)
+                            scale_gt_distances_d30 = dists_d30[scale_gt_tokens]  # (num_patches_square, V)
+                            
+                            # Get probabilities for this scale
+                            scale_probs_d16 = probs_d16[b, start_idx:end_idx]  # (num_patches_square, V)
+                            scale_probs_d30 = probs_d30[b, start_idx:end_idx]  # (num_patches_square, V)
+                            
+                            # Flatten and collect
+                            flat_distances_d16 = scale_gt_distances_d16.view(-1).detach().cpu().numpy()
+                            flat_probs_d16 = scale_probs_d16.view(-1).detach().cpu().numpy()
+                            flat_distances_d30 = scale_gt_distances_d30.view(-1).detach().cpu().numpy()
+                            flat_probs_d30 = scale_probs_d30.view(-1).detach().cpu().numpy()
+                            
+                            # Also store for overall plots
+                            temp_scale_distances_probs_d16[scale_idx]['distances'].append(flat_distances_d16)
+                            temp_scale_distances_probs_d16[scale_idx]['probs'].append(flat_probs_d16)
+                            temp_scale_distances_probs_d30[scale_idx]['distances'].append(flat_distances_d30)
+                            temp_scale_distances_probs_d30[scale_idx]['probs'].append(flat_probs_d30)
+                            
+                            start_idx = end_idx
 
-                        # Process based on whether the class label matches or not
-                        elif class_labels[b] == label.item():
-                            # Correct class condition - use existing code
-                            # Initialize data structure for this sample if needed
-                            if idx not in sample_scale_distances_probs_d16:
-                                sample_scale_distances_probs_d16[idx] = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
-                                sample_scale_distances_probs_d30[idx] = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
-                                
-                            for scale_idx, num_patches in enumerate(patch_nums):
-                                num_patches_square = num_patches * num_patches
-                                end_idx = start_idx + num_patches_square
-                                
-                                # Get ground truth tokens for this scale
-                                scale_gt_tokens = gt_tokens[b, start_idx:end_idx]  # (num_patches_square)
-                                
-                                # Get distances from gt_tokens to all other tokens
-                                scale_gt_distances_d16 = dists_d16[scale_gt_tokens]  # (num_patches_square, V)
-                                scale_gt_distances_d30 = dists_d30[scale_gt_tokens]  # (num_patches_square, V)
-                                
-                                # Get probabilities for this scale
-                                scale_probs_d16 = probs_d16[b, start_idx:end_idx]  # (num_patches_square, V)
-                                scale_probs_d30 = probs_d30[b, start_idx:end_idx]  # (num_patches_square, V)
-                                
-                                # Flatten and collect
-                                flat_distances_d16 = scale_gt_distances_d16.view(-1).detach().cpu().numpy()
-                                flat_probs_d16 = scale_probs_d16.view(-1).detach().cpu().numpy()
-                                flat_distances_d30 = scale_gt_distances_d30.view(-1).detach().cpu().numpy()
-                                flat_probs_d30 = scale_probs_d30.view(-1).detach().cpu().numpy()
-                                
-                                # Store for later plotting
-                                sample_scale_distances_probs_d16[idx][scale_idx]['distances'].append(flat_distances_d16)
-                                sample_scale_distances_probs_d16[idx][scale_idx]['probs'].append(flat_probs_d16)
-                                sample_scale_distances_probs_d30[idx][scale_idx]['distances'].append(flat_distances_d30)
-                                sample_scale_distances_probs_d30[idx][scale_idx]['probs'].append(flat_probs_d30)
-                                
-                                # Also store for overall plots
-                                overall_scale_distances_probs_d16[scale_idx]['distances'].append(flat_distances_d16)
-                                overall_scale_distances_probs_d16[scale_idx]['probs'].append(flat_probs_d16)
-                                overall_scale_distances_probs_d30[scale_idx]['distances'].append(flat_distances_d30)
-                                overall_scale_distances_probs_d30[scale_idx]['probs'].append(flat_probs_d30)
-                                
-                                start_idx = end_idx
-                                
-                        else:
-                            # Wrong class condition - store separately
-                            # Initialize data structure for this sample if needed
-                            if idx not in sample_scale_distances_probs_d16_wrong:
-                                sample_scale_distances_probs_d16_wrong[idx] = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
-                                sample_scale_distances_probs_d30_wrong[idx] = {scale_idx: {'distances': [], 'probs': []} for scale_idx in range(len(patch_nums))}
-                                
-                            for scale_idx, num_patches in enumerate(patch_nums):
-                                num_patches_square = num_patches * num_patches
-                                end_idx = start_idx + num_patches_square
-                                
-                                # Get ground truth tokens for this scale
-                                scale_gt_tokens = gt_tokens[b, start_idx:end_idx]  # (num_patches_square)
-                                
-                                # Get distances from gt_tokens to all other tokens
-                                scale_gt_distances_d16 = dists_d16[scale_gt_tokens]  # (num_patches_square, V)
-                                scale_gt_distances_d30 = dists_d30[scale_gt_tokens]  # (num_patches_square, V)
-                                
-                                # Get probabilities for this scale
-                                scale_probs_d16 = probs_d16[b, start_idx:end_idx]  # (num_patches_square, V)
-                                scale_probs_d30 = probs_d30[b, start_idx:end_idx]  # (num_patches_square, V)
-                                
-                                # Flatten and collect
-                                flat_distances_d16 = scale_gt_distances_d16.view(-1).detach().cpu().numpy()
-                                flat_probs_d16 = scale_probs_d16.view(-1).detach().cpu().numpy()
-                                flat_distances_d30 = scale_gt_distances_d30.view(-1).detach().cpu().numpy()
-                                flat_probs_d30 = scale_probs_d30.view(-1).detach().cpu().numpy()
-                                
-                                # Store wrong class data for later plotting 
-                                sample_scale_distances_probs_d16_wrong[idx][scale_idx]['distances'].append(flat_distances_d16)
-                                sample_scale_distances_probs_d16_wrong[idx][scale_idx]['probs'].append(flat_probs_d16)
-                                sample_scale_distances_probs_d30_wrong[idx][scale_idx]['distances'].append(flat_distances_d30)
-                                sample_scale_distances_probs_d30_wrong[idx][scale_idx]['probs'].append(flat_probs_d30)
-                                
-                                # Also store for overall wrong condition plots
-                                overall_scale_distances_probs_d16_wrong[scale_idx]['distances'].append(flat_distances_d16)
-                                overall_scale_distances_probs_d16_wrong[scale_idx]['probs'].append(flat_probs_d16)
-                                overall_scale_distances_probs_d30_wrong[scale_idx]['distances'].append(flat_distances_d30)
-                                overall_scale_distances_probs_d30_wrong[scale_idx]['probs'].append(flat_probs_d30)
-                                
-                                start_idx = end_idx
+                distance_probs_list_d16.append(temp_scale_distances_probs_d16)
+                distance_probs_list_d30.append(temp_scale_distances_probs_d30)
 
                 # Append per-sample lists.
                 prob_list_d16.append(gt_probs_d16)
@@ -735,7 +678,33 @@ def main():
         # Calculate overall predictions
         pred_idx_d16 = torch.argmax(log_likelihood_list_d16[:-1])
         pred_idx_d30 = torch.argmax(log_likelihood_list_d30[:-1])
-        
+
+        if args.plot_dist_prob:
+            # Create a mask to exclude the label position and the last element
+            mask_d16 = torch.ones_like(log_likelihood_list_d16[:-1], dtype=torch.bool)
+            mask_d16[label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())] = False
+            
+            # Find largest element excluding the label position
+            largest_non_target_idx_d16 = torch.argmax(log_likelihood_list_d16[:-1][mask_d16])
+            
+            # Do the same for d30
+            mask_d30 = torch.ones_like(log_likelihood_list_d30[:-1], dtype=torch.bool)
+            mask_d30[label.item() if args.dataset != "imagenet-a" else class_indices.index(label.item())] = False
+            
+            largest_non_target_idx_d30 = torch.argmax(log_likelihood_list_d30[:-1][mask_d30])
+
+            for scale_idx in range(len(patch_nums)):
+                for attr in ["distances", "probs"]:
+                    for sample in distance_probs_list_d16[pred_idx_d16.item()][scale_idx][attr]:
+                        overall_scale_distances_probs_d16[scale_idx][attr].append(sample)
+                    for sample in distance_probs_list_d30[pred_idx_d30.item()][scale_idx][attr]:
+                        overall_scale_distances_probs_d30[scale_idx][attr].append(sample)
+                    for sample in distance_probs_list_d16[largest_non_target_idx_d16.item()][scale_idx][attr]:
+                        overall_scale_distances_probs_d16_wrong[scale_idx][attr].append(sample)
+                    for sample in distance_probs_list_d30[largest_non_target_idx_d30.item()][scale_idx][attr]:
+                        overall_scale_distances_probs_d30_wrong[scale_idx][attr].append(sample)
+
+
         # For ImageNet-A, map the prediction index to the actual class index
         if args.dataset == "imagenet-a":
             pred_d16 = torch.tensor(class_indices[pred_idx_d16.item()], device=pred_idx_d16.device)
@@ -799,7 +768,7 @@ def main():
         # ---------------------------------------------------------
 
     # Plot token distance vs. probability for each scale and sample
-    if args.plot_dist_prob and args.mode == "l2_dist":
+    if args.plot_dist_prob:
         logging.info(f"Generating token distance vs. probability plots for each sample...")
         
         # Generate unified plots combining correct and wrong conditions
