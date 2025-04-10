@@ -72,85 +72,6 @@ def analyze_model_differences(data):
         'both_wrong': both_wrong
     }
 
-def analyze_likelihood_differences(category_data):
-    """Analyze log likelihood differences in the focus category (d16 correct, d30 wrong)."""
-    d16_correct_d30_wrong = category_data['d16_correct_d30_wrong']
-    
-    # Extract likelihood data
-    likelihood_data = []
-    for item in d16_correct_d30_wrong:
-        label = item['label']
-        d16_target_ll = item['target_log_likelihood_d16']
-        d30_target_ll = item['target_log_likelihood_d30']
-        
-        # Find what d30 predicted instead
-        d30_pred = item['pred_d30']
-        
-        # Find likelihood of d30's prediction in both models
-        d16_ll_list = item['log_likelihood_d16'][:-1]  # Exclude unconditional
-        d30_ll_list = item['log_likelihood_d30'][:-1]  # Exclude unconditional
-        
-        d16_d30pred_ll = d16_ll_list[d30_pred]
-        d30_d30pred_ll = d30_ll_list[d30_pred]
-        
-        # Calculate margins and differences
-        d16_margin = d16_target_ll - d16_d30pred_ll
-        d30_margin = d30_target_ll - d30_d30pred_ll
-        
-        likelihood_data.append({
-            'sample_id': item['sample_id'],
-            'label': label,
-            'd30_pred': d30_pred,
-            'd16_target_ll': d16_target_ll,
-            'd30_target_ll': d30_target_ll,
-            'd16_d30pred_ll': d16_d30pred_ll,
-            'd30_d30pred_ll': d30_d30pred_ll,
-            'd16_margin': d16_margin,
-            'd30_margin': d30_margin,
-            'd16_d30_target_diff': d16_target_ll - d30_target_ll,
-            'd16_d30_wrong_diff': d16_d30pred_ll - d30_d30pred_ll
-        })
-    
-    # Convert to DataFrame for easier analysis
-    df = pd.DataFrame(likelihood_data)
-    
-    # Analyze and plot the differences
-    plt.figure(figsize=(14, 10))
-    plt.subplot(2, 2, 1)
-    sns.histplot(df['d16_d30_target_diff'], kde=True)
-    plt.title('D16 - D30 Log Likelihood Difference for True Class')
-    plt.xlabel('Difference')
-    plt.axvline(x=0, color='r', linestyle='--')
-    
-    plt.subplot(2, 2, 2)
-    sns.histplot(df['d16_margin'], color='blue', kde=True, label='D16')
-    sns.histplot(df['d30_margin'], color='red', kde=True, label='D30')
-    plt.title('Margin between True Class and D30\'s Prediction')
-    plt.xlabel('Margin (True - D30 Pred)')
-    plt.axvline(x=0, color='k', linestyle='--')
-    plt.legend()
-    
-    plt.subplot(2, 2, 3)
-    error_classes = df['d30_pred'].value_counts().reset_index()
-    error_classes.columns = ['class', 'count']
-    sns.barplot(x='class', y='count', data=error_classes)
-    plt.title('D30 Error Distribution by Predicted Class')
-    plt.xlabel('Class ID')
-    plt.xticks(rotation=45)
-    
-    plt.subplot(2, 2, 4)
-    ground_truth_classes = df['label'].value_counts().reset_index()
-    ground_truth_classes.columns = ['class', 'count']
-    sns.barplot(x='class', y='count', data=ground_truth_classes)
-    plt.title('D30 Error Distribution by Ground Truth Class')
-    plt.xlabel('Class ID')
-    plt.xticks(rotation=45)
-    
-    plt.tight_layout()
-    plt.savefig(osp.join(OUTPUT_DIR, 'd16_correct_d30_wrong_analysis.png'))
-    
-    return df
-
 def analyze_confusion_patterns(category_data):
     """Analyze confusion patterns where d16 is correct but d30 is wrong."""
     d16_correct_d30_wrong = category_data['d16_correct_d30_wrong']
@@ -184,82 +105,6 @@ def analyze_confusion_patterns(category_data):
     
     return confusion_matrix, classes
 
-def analyze_log_likelihood_patterns(category_data):
-    """Analyze patterns in log likelihood distributions."""
-    d16_correct_d30_wrong = category_data['d16_correct_d30_wrong']
-    
-    # For each sample where d16 is correct but d30 is wrong,
-    # analyze the full likelihood distribution across all classes
-    
-    # Calculate rankings of true class in both models
-    rank_data = []
-    for item in d16_correct_d30_wrong:
-        d16_lls = np.array(item['log_likelihood_d16'][:-1])  # Exclude unconditional
-        d30_lls = np.array(item['log_likelihood_d30'][:-1])  # Exclude unconditional
-        
-        true_class = item['label']
-        
-        # Get rankings (higher log likelihood = better)
-        d16_ranking = len(d16_lls) - np.argsort(np.argsort(d16_lls))[true_class]
-        d30_ranking = len(d30_lls) - np.argsort(np.argsort(d30_lls))[true_class]
-        
-        # Calculate differences between top class and true class
-        d16_top_idx = np.argmax(d16_lls)
-        d30_top_idx = np.argmax(d30_lls)
-        
-        d16_diff_to_top = d16_lls[d16_top_idx] - d16_lls[true_class] if d16_top_idx != true_class else 0
-        d30_diff_to_top = d30_lls[d30_top_idx] - d30_lls[true_class] if d30_top_idx != true_class else 0
-        
-        # Calculate standard deviation of log likelihoods
-        d16_std = np.std(d16_lls)
-        d30_std = np.std(d30_lls)
-        
-        rank_data.append({
-            'sample_id': item['sample_id'],
-            'label': true_class,
-            'd16_rank': d16_ranking,
-            'd30_rank': d30_ranking,
-            'd16_diff_to_top': d16_diff_to_top,
-            'd30_diff_to_top': d30_diff_to_top,
-            'd16_std': d16_std,
-            'd30_std': d30_std
-        })
-    
-    # Convert to DataFrame
-    rank_df = pd.DataFrame(rank_data)
-    
-    # Plot the results
-    plt.figure(figsize=(15, 10))
-    
-    plt.subplot(2, 2, 1)
-    sns.histplot(rank_df['d16_rank'], color='blue', kde=True, label='D16')
-    sns.histplot(rank_df['d30_rank'], color='red', kde=True, label='D30')
-    plt.title('Ranking of True Class in Log Likelihood')
-    plt.xlabel('Rank (1 = highest log likelihood)')
-    plt.legend()
-    
-    plt.subplot(2, 2, 2)
-    sns.histplot(rank_df['d30_diff_to_top'], kde=True)
-    plt.title('D30: Difference between Top Class and True Class')
-    plt.xlabel('Log Likelihood Difference')
-    
-    plt.subplot(2, 2, 3)
-    sns.scatterplot(data=rank_df, x='d16_std', y='d30_std')
-    plt.plot([0, plt.xlim()[1]], [0, plt.xlim()[1]], 'r--')
-    plt.title('Standard Deviation of Log Likelihoods')
-    plt.xlabel('D16 Std Dev')
-    plt.ylabel('D30 Std Dev')
-    
-    plt.subplot(2, 2, 4)
-    sns.histplot(rank_df['d16_std'] - rank_df['d30_std'], kde=True)
-    plt.title('Difference in Std Dev (D16 - D30)')
-    plt.xlabel('Std Dev Difference')
-    plt.axvline(x=0, color='r', linestyle='--')
-    
-    plt.tight_layout()
-    plt.savefig(osp.join(OUTPUT_DIR, 'rank_analysis.png'))
-    
-    return rank_df
 
 def analyze_specific_samples(df_likelihood, n=5):
     """Select and analyze specific interesting samples for deeper investigation."""
@@ -442,6 +287,243 @@ def analyze_layer_differences(category_data, output_dir):
         'all_accumulated': all_acc_df
     }
 
+def compare_var_l2dist_methods(output_dir):
+    """Compare VAR and L2_dist methods for both layerwise and layer_acc data."""
+    # Define paths to data directories
+    var_layer_acc_dir = "./model_size_analysis/imagenet10/var/var_cfg[0.0]/layer_acc"
+    var_layerwise_dir = "./model_size_analysis/imagenet10/var/var_cfg[0.0]/layerwise"
+    l2dist_layer_acc_dir = "./model_size_analysis/imagenet10/l2_dist/var_cfg[0.0]/layer_acc"
+    l2dist_layerwise_dir = "./model_size_analysis/imagenet10/l2_dist/var_cfg[0.0]/layerwise"
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Collect data for each scale (0-9)
+    scales = list(range(10))
+    
+    # Data structures to store results
+    data = {
+        'var_layer_acc': {scale: [] for scale in scales},
+        'var_layerwise': {scale: [] for scale in scales},
+        'l2dist_layer_acc': {scale: [] for scale in scales},
+        'l2dist_layerwise': {scale: [] for scale in scales}
+    }
+    
+    # Load and process data from all directories
+    for scale in scales:
+        # Process VAR layer_acc files
+        for file in os.listdir(var_layer_acc_dir):
+            if file.endswith(f"{scale}-layer_acc.json"):
+                with open(osp.join(var_layer_acc_dir, file), 'r') as f:
+                    try:
+                        item = json.load(f)
+                        item['sample_id'] = int(file.split('_')[0])
+                        item['scale'] = scale
+                        data['var_layer_acc'][scale].append(item)
+                    except json.JSONDecodeError:
+                        print(f"Error reading {file} in var_layer_acc_dir")
+        
+        # Process VAR layerwise files
+        for file in os.listdir(var_layerwise_dir):
+            if file.endswith(f"{scale}-layer.json"):
+                with open(osp.join(var_layerwise_dir, file), 'r') as f:
+                    try:
+                        item = json.load(f)
+                        item['sample_id'] = int(file.split('_')[0])
+                        item['scale'] = scale
+                        data['var_layerwise'][scale].append(item)
+                    except json.JSONDecodeError:
+                        print(f"Error reading {file} in var_layerwise_dir")
+        
+        # Process L2_dist layer_acc files
+        for file in os.listdir(l2dist_layer_acc_dir):
+            if file.endswith(f"{scale}-layer_acc.json"):
+                with open(osp.join(l2dist_layer_acc_dir, file), 'r') as f:
+                    try:
+                        item = json.load(f)
+                        item['sample_id'] = int(file.split('_')[0])
+                        item['scale'] = scale
+                        data['l2dist_layer_acc'][scale].append(item)
+                    except json.JSONDecodeError:
+                        print(f"Error reading {file} in l2dist_layer_acc_dir")
+        
+        # Process L2_dist layerwise files
+        for file in os.listdir(l2dist_layerwise_dir):
+            if file.endswith(f"{scale}-layer.json"):
+                with open(osp.join(l2dist_layerwise_dir, file), 'r') as f:
+                    try:
+                        item = json.load(f)
+                        item['sample_id'] = int(file.split('_')[0])
+                        item['scale'] = scale
+                        data['l2dist_layerwise'][scale].append(item)
+                    except json.JSONDecodeError:
+                        print(f"Error reading {file} in l2dist_layerwise_dir")
+    
+    # Analyze accuracy at each scale for both methods
+    summary = {
+        'var_layer_acc': [],
+        'var_layerwise': [],
+        'l2dist_layer_acc': [],
+        'l2dist_layerwise': []
+    }
+    
+    # Process layerwise data (individual scale contributions)
+    for scale in scales:
+        for method_key in ['var_layerwise', 'l2dist_layerwise']:
+            if not data[method_key][scale]:
+                continue
+            
+            # Count correct predictions for each model
+            items = data[method_key][scale]
+            d16_correct = sum(1 for item in items if item['pred_d16'] == item['label'])
+            d30_correct = sum(1 for item in items if item['pred_d30'] == item['label'])
+            total = len(items)
+            
+            if total > 0:
+                summary[method_key].append({
+                    'scale': scale,
+                    'patch_size': 2**scale,
+                    'd16_acc': d16_correct / total * 100,
+                    'd30_acc': d30_correct / total * 100,
+                    'acc_diff': (d16_correct - d30_correct) / total * 100,
+                    'sample_count': total
+                })
+    
+    # Process layer_acc data (accumulated up to each scale)
+    for scale in scales:
+        for method_key in ['var_layer_acc', 'l2dist_layer_acc']:
+            if not data[method_key][scale]:
+                continue
+            
+            # Count correct predictions for each model
+            items = data[method_key][scale]
+            d16_correct = sum(1 for item in items if item['pred_d16'] == item['label'])
+            d30_correct = sum(1 for item in items if item['pred_d30'] == item['label'])
+            total = len(items)
+            
+            if total > 0:
+                summary[method_key].append({
+                    'scale': scale,
+                    'patch_size': 2**scale,
+                    'd16_acc': d16_correct / total * 100,
+                    'd30_acc': d30_correct / total * 100,
+                    'acc_diff': (d16_correct - d30_correct) / total * 100,
+                    'sample_count': total
+                })
+    
+    # Convert to DataFrames
+    dfs = {}
+    for key in summary:
+        if summary[key]:
+            dfs[key] = pd.DataFrame(summary[key])
+        else:
+            dfs[key] = pd.DataFrame()
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    
+    # Plot 1: Layerwise comparison (individual scale contributions)
+    ax1.set_title('Layerwise Accuracy Comparison\n(Individual Scale Contributions)', fontsize=14)
+    ax1.set_xlabel('Scale Index (Patch Size = 2^scale)', fontsize=12)
+    ax1.set_ylabel('Accuracy (%)', fontsize=12)
+    ax1.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add var layerwise data to plot
+    if not dfs['var_layerwise'].empty:
+        sns.lineplot(x='scale', y='d16_acc', data=dfs['var_layerwise'], 
+                     marker='o', label='VAR D16', color='blue', ax=ax1)
+        sns.lineplot(x='scale', y='d30_acc', data=dfs['var_layerwise'], 
+                     marker='s', label='VAR D30', color='lightblue', ax=ax1)
+        # Annotate VAR sample count for reference
+        for idx, row in dfs['var_layerwise'].iterrows():
+            ax1.annotate(f"n={int(row['sample_count'])}", 
+                        (row['scale'], row['d16_acc']-3),
+                        fontsize=8, color='blue', alpha=0.7)
+    
+    # Add l2dist layerwise data to plot
+    if not dfs['l2dist_layerwise'].empty:
+        sns.lineplot(x='scale', y='d16_acc', data=dfs['l2dist_layerwise'], 
+                     marker='^', label='L2_DIST D16', color='red', ax=ax1)
+        sns.lineplot(x='scale', y='d30_acc', data=dfs['l2dist_layerwise'], 
+                     marker='d', label='L2_DIST D30', color='lightcoral', ax=ax1)
+    
+    ax1.legend(loc='lower right')
+    
+    # Plot 2: Layer_acc comparison (accumulated up to each scale)
+    ax2.set_title('Accumulated Accuracy Comparison\n(Up to Each Scale)', fontsize=14)
+    ax2.set_xlabel('Scale Index (Patch Size = 2^scale)', fontsize=12)
+    ax2.set_ylabel('Accuracy (%)', fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add var layer_acc data to plot
+    if not dfs['var_layer_acc'].empty:
+        sns.lineplot(x='scale', y='d16_acc', data=dfs['var_layer_acc'], 
+                     marker='o', label='VAR D16', color='blue', ax=ax2)
+        sns.lineplot(x='scale', y='d30_acc', data=dfs['var_layer_acc'], 
+                     marker='s', label='VAR D30', color='lightblue', ax=ax2)
+        # Annotate VAR sample count for reference
+        for idx, row in dfs['var_layer_acc'].iterrows():
+            ax2.annotate(f"n={int(row['sample_count'])}", 
+                        (row['scale'], row['d16_acc']-3),
+                        fontsize=8, color='blue', alpha=0.7)
+    
+    # Add l2dist layer_acc data to plot
+    if not dfs['l2dist_layer_acc'].empty:
+        sns.lineplot(x='scale', y='d16_acc', data=dfs['l2dist_layer_acc'], 
+                     marker='^', label='L2_DIST D16', color='red', ax=ax2)
+        sns.lineplot(x='scale', y='d30_acc', data=dfs['l2dist_layer_acc'], 
+                     marker='d', label='L2_DIST D30', color='lightcoral', ax=ax2)
+    
+    ax2.legend(loc='lower right')
+    
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig(osp.join(output_dir, 'var_vs_l2dist_comparison.png'))
+    
+    # Print summary
+    print("\nComparison of VAR and L2_DIST Methods:")
+    
+    print("\nLayerwise (Individual Scale Contributions):")
+    print("------------------------------------------")
+    print("VAR Method:")
+    for idx, row in dfs['var_layerwise'].iterrows():
+        scale = int(row['scale'])
+        print(f"  Scale {scale} (Patch Size {int(row['patch_size'])}):")
+        print(f"    D16 accuracy: {row['d16_acc']:.2f}%")
+        print(f"    D30 accuracy: {row['d30_acc']:.2f}%")
+        print(f"    Difference (D16-D30): {row['acc_diff']:.2f}%")
+        print(f"    Sample count: {int(row['sample_count'])}")
+    
+    print("\nL2_DIST Method:")
+    for idx, row in dfs['l2dist_layerwise'].iterrows():
+        scale = int(row['scale'])
+        print(f"  Scale {scale} (Patch Size {int(row['patch_size'])}):")
+        print(f"    D16 accuracy: {row['d16_acc']:.2f}%")
+        print(f"    D30 accuracy: {row['d30_acc']:.2f}%")
+        print(f"    Difference (D16-D30): {row['acc_diff']:.2f}%")
+        print(f"    Sample count: {int(row['sample_count'])}")
+    
+    print("\nLayer_acc (Accumulated Up to Each Scale):")
+    print("----------------------------------------")
+    print("VAR Method:")
+    for idx, row in dfs['var_layer_acc'].iterrows():
+        scale = int(row['scale'])
+        print(f"  Scale {scale} (Patch Size {int(row['patch_size'])}):")
+        print(f"    D16 accuracy: {row['d16_acc']:.2f}%")
+        print(f"    D30 accuracy: {row['d30_acc']:.2f}%")
+        print(f"    Difference (D16-D30): {row['acc_diff']:.2f}%")
+        print(f"    Sample count: {int(row['sample_count'])}")
+    
+    print("\nL2_DIST Method:")
+    for idx, row in dfs['l2dist_layer_acc'].iterrows():
+        scale = int(row['scale'])
+        print(f"  Scale {scale} (Patch Size {int(row['patch_size'])}):")
+        print(f"    D16 accuracy: {row['d16_acc']:.2f}%")
+        print(f"    D30 accuracy: {row['d30_acc']:.2f}%")
+        print(f"    Difference (D16-D30): {row['acc_diff']:.2f}%")
+        print(f"    Sample count: {int(row['sample_count'])}")
+    
+    return dfs
+
 def main():
     # Load data
     print("Loading data from", DATA_DIR)
@@ -454,28 +536,15 @@ def main():
     print("="*50)
     category_data = analyze_model_differences(data)
     
-    # Focus on d16 correct, d30 wrong cases
+    # Comparison between VAR and L2_dist methods
     print("\n" + "="*50)
-    print("ANALYZING D16 CORRECT, D30 WRONG CASES")
+    print("COMPARING VAR AND L2_DIST METHODS")
     print("="*50)
+    method_comparison = compare_var_l2dist_methods(OUTPUT_DIR)
     
-    # Log likelihood differences analysis
-    df_likelihood = analyze_likelihood_differences(category_data)
-    
-    # Confusion patterns
-    confusion_matrix, classes = analyze_confusion_patterns(category_data)
-    
-    # Ranking analysis
-    rank_df = analyze_log_likelihood_patterns(category_data)
-    
-    # Layer-specific analysis (using the layer_analysis, layer_acc_analysis, and layer_cond_analysis directories)
-    print("\n" + "="*50)
-    print("ANALYZING LAYER-SPECIFIC DIFFERENCES")
-    print("="*50)
-    layer_dfs = analyze_layer_differences(category_data, OUTPUT_DIR)
-    
-    # Interesting samples for further investigation
-    interesting_samples = analyze_specific_samples(df_likelihood)
+    # Other analyses can be uncommented as needed
+    # confusion_matrix, classes = analyze_confusion_patterns(category_data)
+    # layer_dfs = analyze_layer_differences(category_data, OUTPUT_DIR)
     
     print("\n" + "="*50)
     print("ANALYSIS COMPLETE")
